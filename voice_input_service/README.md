@@ -87,7 +87,7 @@ Invoke-RestMethod http://127.0.0.1:8766/diagnostics | ConvertTo-Json -Depth 8
 
 Результат містить `max_openwakeword_score`, десять найсильніших точок, Vosk hypotheses і час детекції. Поріг `JARVIS_WAKE_THRESHOLD` змінюйте лише після кількох записів «Джарвіс» та кількох негативних фраз/кімнатного шуму. Фонетичні варіанти Vosk видно в `vosk_hypotheses`; додавати їх у matcher слід лише якщо вони повторюються на позитивних записах і не виникають на негативних.
 
-Додаткові підтверджені варіанти задаються через кому, наприклад `JARVIS_WAKE_VARIANTS=джарвіс,джарвис,джарвиз,підтверджений_варіант`. Нечіткий fuzzy-match навмисно вимкнений, щоб випадкові слова на кшталт «джерело» не активували Jarvis.
+Додаткові підтверджені варіанти задаються через кому, наприклад `JARVIS_WAKE_VARIANTS=джарвіс,джарвис,джарвиз,підтверджений_варіант`. `JARVIS_WAKE_VOSK_MAX_EDIT_DISTANCE=1` дозволяє одну помилку Vosk у слові (наприклад, пропущену літеру), але не приймає віддалені слова на кшталт «джерело». Значення `0` повертає точний match; вище `1` без окремого тестування ставити не варто.
 
 ## Перевірка базового сценарію 9/10
 
@@ -106,22 +106,27 @@ Invoke-RestMethod http://127.0.0.1:8766/diagnostics | ConvertTo-Json -Depth 8
 Основні змінні у `D:\Jarvis\.env`:
 
 ```dotenv
-JARVIS_VAD_AGGRESSIVENESS=2
-JARVIS_VAD_ENERGY_RATIO=1.20
-JARVIS_VAD_ENERGY_DELTA=0.012
-JARVIS_VAD_START_CHUNKS=2
-JARVIS_END_SILENCE_MS=1400
-JARVIS_PRE_ROLL_MS=400
-JARVIS_POST_ROLL_MS=320
-JARVIS_MIN_SPEECH_MS=450
-JARVIS_MIN_AUDIO_RMS=0.0025
+JARVIS_WAKE_THRESHOLD=0.45
+JARVIS_WAKE_VARIANTS=джарвіс,джарвис,джарвиз
+JARVIS_WAKE_VOSK_MAX_EDIT_DISTANCE=1
+JARVIS_VAD_AGGRESSIVENESS=1
+JARVIS_VAD_ENERGY_RATIO=1.10
+JARVIS_VAD_ENERGY_DELTA=0.004
+JARVIS_VAD_START_CHUNKS=1
+JARVIS_END_SILENCE_MS=1200
+JARVIS_PRE_ROLL_MS=560
+JARVIS_POST_ROLL_MS=480
+JARVIS_MIN_SPEECH_MS=300
+JARVIS_MIN_AUDIO_RMS=0.0015
 JARVIS_BARGE_IN_ENABLED=false
-JARVIS_POST_TTS_GUARD_MS=650
+JARVIS_POST_TTS_GUARD_MS=250
 ```
 
-Поверх WebRTC VAD працює адаптивний energy gate. Він вимірює фоновий RMS у режимі очікування і пропускає speech лише коли рівень перевищує фон за ratio/delta протягом щонайменше двох chunks. Це захищає Whisper від 20-секундних записів сталого шуму, який драйвер Realtek помилково позначає як голос.
+Поверх WebRTC VAD працює адаптивний energy gate. Він вимірює фоновий RMS у режимі очікування та обережно продовжує оновлювати rolling median під час активної розмовної сесії на кадрах нижче поточного energy-порога. Це працює навіть тоді, коли WebRTC помилково вважає сталий шум Realtek голосом. Speech проходить, коли рівень перевищує фон за ratio/delta. Так Whisper захищений від довгих записів шуму, а поріг не заморожується після wake word.
 
-Якщо `last_whisper.wav` не має першого складу — збільште `JARVIS_PRE_ROLL_MS` до `560`. Якщо обрізано кінець — збільште `JARVIS_POST_ROLL_MS` до `480` або `JARVIS_END_SILENCE_MS`. Якщо в записі чути TTS з колонок, barge-in лишіть `false`; навушники/направлений мікрофон дозволяють перевірити `true` без зміни коду.
+`pre-roll` додається перед першим speech-frame, а з кінцевої тиші до Whisper лишається щонайменше налаштований `post-roll` (інтервали округлюються вгору до цілого 80-мс кадру). Поки попередня репліка обробляється Whisper, новий capture явно призупинений: сервіс не накопичує урізану команду і відновлює слухання після завершення STT. Дочекайтеся виконання попередньої команди перед наступною реплікою.
+
+Якщо `last_whisper.wav` усе ще не має першого складу — збільшуйте `JARVIS_PRE_ROLL_MS` кроками по `80`. Якщо обрізано кінець — так само збільшуйте `JARVIS_POST_ROLL_MS` або `JARVIS_END_SILENCE_MS`. Якщо в записі чути TTS з колонок, barge-in лишіть `false`; навушники/направлений мікрофон дозволяють перевірити `true` без зміни коду.
 
 ## API і тести
 

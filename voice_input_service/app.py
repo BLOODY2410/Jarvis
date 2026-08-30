@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import threading
 import time
@@ -78,14 +79,15 @@ class Settings:
     stt_prompt: str
     diagnostic: bool = False
     level_log_interval_ms: int = 1_000
-    pre_roll_ms: int = 400
-    post_roll_ms: int = 320
+    pre_roll_ms: int = 560
+    post_roll_ms: int = 480
     diagnostic_dir: Path = SERVICE_ROOT / "diagnostics"
     stt_response_format: str = "verbose_json"
     wake_variants: tuple[str, ...] = ("джарвіс", "джарвис", "джарвиз")
-    vad_energy_ratio: float = 1.20
-    vad_energy_delta: float = 0.012
-    vad_start_chunks: int = 2
+    wake_vosk_max_edit_distance: int = 1
+    vad_energy_ratio: float = 1.10
+    vad_energy_delta: float = 0.004
+    vad_start_chunks: int = 1
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -99,14 +101,14 @@ class Settings:
             language=os.getenv("JARVIS_STT_LANGUAGE", "uk"),
             device=device,
             wake_threshold=env_float("JARVIS_WAKE_THRESHOLD", 0.45),
-            vad_aggressiveness=int(env_float("JARVIS_VAD_AGGRESSIVENESS", 2)),
-            silence_ms=int(env_float("JARVIS_END_SILENCE_MS", 1_400)),
+            vad_aggressiveness=int(env_float("JARVIS_VAD_AGGRESSIVENESS", 1)),
+            silence_ms=int(env_float("JARVIS_END_SILENCE_MS", 1_200)),
             max_utterance_secs=env_float("JARVIS_MAX_UTTERANCE_SECS", 20.0),
             barge_in_chunks=max(1, int(env_float("JARVIS_BARGE_IN_CHUNKS", 3))),
             barge_in_enabled=env_bool("JARVIS_BARGE_IN_ENABLED", False),
-            min_speech_ms=max(200, int(env_float("JARVIS_MIN_SPEECH_MS", 450))),
-            min_audio_rms=env_float("JARVIS_MIN_AUDIO_RMS", 0.0025),
-            post_tts_guard_ms=max(0, int(env_float("JARVIS_POST_TTS_GUARD_MS", 650))),
+            min_speech_ms=max(0, int(env_float("JARVIS_MIN_SPEECH_MS", 300))),
+            min_audio_rms=max(0.0, env_float("JARVIS_MIN_AUDIO_RMS", 0.0015)),
+            post_tts_guard_ms=max(0, int(env_float("JARVIS_POST_TTS_GUARD_MS", 250))),
             stt_prompt=os.getenv(
                 "JARVIS_STT_PROMPT",
                 "Українська голосова команда для персонального асистента Джарвіс. "
@@ -114,8 +116,8 @@ class Settings:
             ),
             diagnostic=env_bool("JARVIS_DIAGNOSTIC", False),
             level_log_interval_ms=max(100, int(env_float("JARVIS_LEVEL_LOG_INTERVAL_MS", 1_000))),
-            pre_roll_ms=max(FRAME_MS, int(env_float("JARVIS_PRE_ROLL_MS", 400))),
-            post_roll_ms=max(0, int(env_float("JARVIS_POST_ROLL_MS", 320))),
+            pre_roll_ms=max(FRAME_MS, int(env_float("JARVIS_PRE_ROLL_MS", 560))),
+            post_roll_ms=max(0, int(env_float("JARVIS_POST_ROLL_MS", 480))),
             diagnostic_dir=Path(os.getenv("JARVIS_DIAGNOSTIC_DIR", str(SERVICE_ROOT / "diagnostics"))).resolve(),
             stt_response_format=os.getenv("JARVIS_STT_RESPONSE_FORMAT", "verbose_json").strip() or "verbose_json",
             wake_variants=tuple(
@@ -123,9 +125,13 @@ class Settings:
                 for item in os.getenv("JARVIS_WAKE_VARIANTS", "джарвіс,джарвис,джарвиз").split(",")
                 if item.strip()
             ),
-            vad_energy_ratio=max(1.0, env_float("JARVIS_VAD_ENERGY_RATIO", 1.20)),
-            vad_energy_delta=max(0.0, env_float("JARVIS_VAD_ENERGY_DELTA", 0.012)),
-            vad_start_chunks=max(1, int(env_float("JARVIS_VAD_START_CHUNKS", 2))),
+            wake_vosk_max_edit_distance=max(
+                0,
+                int(env_float("JARVIS_WAKE_VOSK_MAX_EDIT_DISTANCE", 1)),
+            ),
+            vad_energy_ratio=max(1.0, env_float("JARVIS_VAD_ENERGY_RATIO", 1.10)),
+            vad_energy_delta=max(0.0, env_float("JARVIS_VAD_ENERGY_DELTA", 0.004)),
+            vad_start_chunks=max(1, int(env_float("JARVIS_VAD_START_CHUNKS", 1))),
         )
 
 
@@ -160,7 +166,7 @@ class VoiceInputEngine:
         self._consecutive_speech_chunks = 0
         self._interrupt_sent = False
         self._stt_busy = False
-        self._pre_roll: deque[bytes] = deque(maxlen=max(1, settings.pre_roll_ms // FRAME_MS))
+        self._pre_roll: deque[bytes] = deque(maxlen=frames_for_ms(settings.pre_roll_ms, minimum=1))
         self._ignore_until = 0.0
         self._capture_started_at: float | None = None
         self._last_level_log = 0.0
@@ -206,6 +212,12 @@ class VoiceInputEngine:
             self.settings.vad_energy_ratio,
             self.settings.vad_energy_delta,
             self.settings.vad_start_chunks,
+        )
+        LOGGER.info(
+            "Wake config: openWakeWord_threshold=%.3f Vosk_variants=%s max_edit_distance=%d",
+            self.settings.wake_threshold,
+            ",".join(self.settings.wake_variants),
+            self.settings.wake_vosk_max_edit_distance,
         )
         self._thread = threading.Thread(target=self._audio_loop, name="jarvis-microphone", daemon=True)
         self._thread.start()
@@ -441,7 +453,11 @@ class VoiceInputEngine:
                 ukrainian_text = self._ukrainian_wake_text(frame)
             self._last_wake_score = score
             self._log_levels_if_due(rms, peak, False, score, ukrainian_text)
-            if score >= self.settings.wake_threshold or contains_wake_word(ukrainian_text, self.settings.wake_variants):
+            if score >= self.settings.wake_threshold or contains_wake_word(
+                ukrainian_text,
+                self.settings.wake_variants,
+                self.settings.wake_vosk_max_edit_distance,
+            ):
                 source = f"openWakeWord score {score:.3f}" if score >= self.settings.wake_threshold else f"Vosk: {ukrainian_text}"
                 LOGGER.info("Wake word detected (%s)", source)
                 with self._lock:
@@ -458,7 +474,11 @@ class VoiceInputEngine:
 
         if stt_busy:
             self._log_levels_if_due(rms, peak, None)
-            self._pre_roll.append(frame)
+            # Keep this path explicitly half-duplex. Buffering only part of a
+            # second utterance while Whisper is busy creates a convincing but
+            # truncated pseudo-capture when STT completes.
+            self._reset_capture()
+            self._pre_roll.clear()
             return
 
         if time.monotonic() < self._ignore_until:
@@ -482,6 +502,12 @@ class VoiceInputEngine:
         self._last_vad_raw = raw_speech
         self._last_energy_gate = energy_pass
         candidate_speech = raw_speech and energy_pass
+        if not self._speech_seen and not energy_pass:
+            # Continue adapting during an active conversation, but only from
+            # frames still below the current energy threshold. This also works
+            # when WebRTC mistakes steady Realtek noise for speech. The rolling
+            # median makes the update resistant to isolated missed speech.
+            self._noise_history.append(rms)
         if not self._speech_seen:
             self._vad_start_run = self._vad_start_run + 1 if candidate_speech else 0
             speech = candidate_speech and self._vad_start_run >= self.settings.vad_start_chunks
@@ -527,12 +553,12 @@ class VoiceInputEngine:
         if self._speech_seen:
             self._capture.append(frame)
 
-        silence_limit = max(1, self.settings.silence_ms // FRAME_MS)
+        silence_limit = frames_for_ms(self.settings.silence_ms, minimum=1)
         max_frames = max(1, int(self.settings.max_utterance_secs * 1_000 // FRAME_MS))
         if self._speech_seen and (self._silence_chunks >= silence_limit or len(self._capture) >= max_frames):
             raw_frames = list(self._capture)
             end_reason = "end_silence" if self._silence_chunks >= silence_limit else "max_duration"
-            post_roll_frames = min(self._silence_chunks, max(0, self.settings.post_roll_ms // FRAME_MS))
+            post_roll_frames = min(self._silence_chunks, frames_for_ms(self.settings.post_roll_ms))
             trailing_to_remove = max(0, self._silence_chunks - post_roll_frames)
             whisper_frames = raw_frames[:-trailing_to_remove] if trailing_to_remove else raw_frames
             speech_ms = self._speech_chunks * FRAME_MS
@@ -550,6 +576,7 @@ class VoiceInputEngine:
             self._reset_capture()
             with self._lock:
                 self._stt_busy = True
+            LOGGER.info("Capture paused until the current Whisper request completes")
             threading.Thread(
                 target=self._transcribe,
                 args=(raw_frames, whisper_frames, speech_ms),
@@ -682,6 +709,7 @@ class VoiceInputEngine:
         finally:
             with self._lock:
                 self._stt_busy = False
+            LOGGER.info("Capture resumed after Whisper request")
 
     def _save_diagnostic_wavs(self, raw_pcm: bytes, whisper_pcm: bytes | None) -> None:
         if not self.settings.diagnostic:
@@ -729,7 +757,12 @@ class VoiceInputEngine:
                 if vosk_text and (not vosk_texts or vosk_text != vosk_texts[-1]):
                     vosk_texts.append(vosk_text)
                 if detected_at_ms is None and (
-                    score >= used_threshold or contains_wake_word(vosk_text, self.settings.wake_variants)
+                    score >= used_threshold
+                    or contains_wake_word(
+                        vosk_text,
+                        self.settings.wake_variants,
+                        self.settings.wake_vosk_max_edit_distance,
+                    )
                 ):
                     detected_at_ms = offset // 2 * 1_000 // SAMPLE_RATE
             if self._vosk_recognizer is not None:
@@ -790,17 +823,52 @@ def read_pcm_wav(path: Path) -> bytes:
         return wav.readframes(wav.getnframes())
 
 
+def frames_for_ms(duration_ms: int, minimum: int = 0) -> int:
+    """Convert milliseconds to whole frames without shortening a configured interval."""
+    if duration_ms <= 0:
+        return minimum
+    return max(minimum, (duration_ms + FRAME_MS - 1) // FRAME_MS)
+
+
+def _bounded_edit_distance(left: str, right: str, limit: int) -> int:
+    """Return Levenshtein distance, stopping once it cannot be within limit."""
+    if abs(len(left) - len(right)) > limit:
+        return limit + 1
+    previous = list(range(len(right) + 1))
+    for row, left_char in enumerate(left, start=1):
+        current = [row]
+        row_min = row
+        for column, right_char in enumerate(right, start=1):
+            value = min(
+                current[-1] + 1,
+                previous[column] + 1,
+                previous[column - 1] + (left_char != right_char),
+            )
+            current.append(value)
+            row_min = min(row_min, value)
+        if row_min > limit:
+            return limit + 1
+        previous = current
+    return previous[-1]
+
+
 def contains_wake_word(
     text: str,
     variants: tuple[str, ...] = ("джарвіс", "джарвис", "джарвиз"),
+    max_edit_distance: int = 1,
 ) -> bool:
-    normalized = text.casefold().replace("'", "").replace("’", "").replace("і", "и")
-    words = set(normalized.split())
-    normalized_variants = {
-        variant.casefold().replace("'", "").replace("’", "").replace("і", "и")
-        for variant in variants
-    }
-    return bool(words & normalized_variants)
+    def normalize(value: str) -> str:
+        value = value.casefold().replace("'", "").replace("’", "").replace("і", "и")
+        return re.sub(r"[^\w]+", " ", value, flags=re.UNICODE).strip()
+
+    words = normalize(text).split()
+    normalized_variants = [normalize(variant) for variant in variants if normalize(variant)]
+    allowed_distance = max(0, max_edit_distance)
+    return any(
+        _bounded_edit_distance(word, variant, allowed_distance) <= allowed_distance
+        for word in words
+        for variant in normalized_variants
+    )
 
 
 settings = Settings.from_environment()
@@ -844,6 +912,7 @@ def diagnostics() -> dict[str, object]:
         "end_silence_ms": settings.silence_ms,
         "wake_threshold": settings.wake_threshold,
         "wake_variants": settings.wake_variants,
+        "wake_vosk_max_edit_distance": settings.wake_vosk_max_edit_distance,
         "barge_in_enabled": settings.barge_in_enabled,
         "last_raw_wav": str(settings.diagnostic_dir / "last_raw.wav"),
         "last_whisper_wav": str(settings.diagnostic_dir / "last_whisper.wav"),

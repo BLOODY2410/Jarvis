@@ -70,3 +70,22 @@ cd D:\Jarvis\voice_input_service
 ```
 
 Повний сценарій стабілізації та пояснення логів є у `voice_input_service\README.md`.
+
+## Перезапуск після зміни voice-конфігів
+
+У вікні Voice Input Core натисніть `Ctrl+C`, потім запустіть його знову:
+
+```powershell
+cd D:\Jarvis\voice_input_service
+.\start.ps1
+```
+
+У вікні Rust Core натисніть `Ctrl+C`, потім:
+
+```powershell
+cd D:\Jarvis
+$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
+cargo run
+```
+
+TTS-sidecar перезапускати не потрібно: його HTTP-контракт і конфіг цими змінами не зачіпаються.
