@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import ctypes.wintypes
 import io
 import json
 import logging
@@ -88,6 +90,13 @@ class Settings:
     vad_energy_ratio: float = 1.10
     vad_energy_delta: float = 0.004
     vad_start_chunks: int = 1
+    activation_mode: str = "hotkey"
+    hotkey_enabled: bool = True
+    fast_whisper_model: str = "whisper-large-v3-turbo"
+    fast_silence_ms: int = 560
+    long_utterance_threshold_ms: int = 3_000
+    fast_stt_max_speech_ms: int = 3_500
+    vad_resume_chunks: int = 2
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -108,13 +117,13 @@ class Settings:
             barge_in_enabled=env_bool("JARVIS_BARGE_IN_ENABLED", False),
             min_speech_ms=max(0, int(env_float("JARVIS_MIN_SPEECH_MS", 300))),
             min_audio_rms=max(0.0, env_float("JARVIS_MIN_AUDIO_RMS", 0.0015)),
-            post_tts_guard_ms=max(0, int(env_float("JARVIS_POST_TTS_GUARD_MS", 250))),
+            post_tts_guard_ms=max(0, int(env_float("JARVIS_POST_TTS_GUARD_MS", 800))),
             stt_prompt=os.getenv(
                 "JARVIS_STT_PROMPT",
                 "Українська голосова команда для персонального асистента Джарвіс. "
                 "Можливі назви Windows, YouTube, Google, браузер, PowerShell, Steam та Discord.",
             ),
-            diagnostic=env_bool("JARVIS_DIAGNOSTIC", False),
+            diagnostic=env_bool("JARVIS_DIAGNOSTIC", True),
             level_log_interval_ms=max(100, int(env_float("JARVIS_LEVEL_LOG_INTERVAL_MS", 1_000))),
             pre_roll_ms=max(FRAME_MS, int(env_float("JARVIS_PRE_ROLL_MS", 560))),
             post_roll_ms=max(0, int(env_float("JARVIS_POST_ROLL_MS", 480))),
@@ -131,7 +140,22 @@ class Settings:
             ),
             vad_energy_ratio=max(1.0, env_float("JARVIS_VAD_ENERGY_RATIO", 1.10)),
             vad_energy_delta=max(0.0, env_float("JARVIS_VAD_ENERGY_DELTA", 0.004)),
-            vad_start_chunks=max(1, int(env_float("JARVIS_VAD_START_CHUNKS", 1))),
+            vad_start_chunks=max(1, int(env_float("JARVIS_VAD_START_CHUNKS", 2))),
+            activation_mode=os.getenv("JARVIS_ACTIVATION_MODE", "hotkey").strip().lower(),
+            hotkey_enabled=env_bool("JARVIS_HOTKEY_ENABLED", True),
+            fast_whisper_model=os.getenv(
+                "JARVIS_FAST_WHISPER_MODEL", "whisper-large-v3-turbo"
+            ).strip() or "whisper-large-v3-turbo",
+            fast_silence_ms=max(
+                400, min(600, int(env_float("JARVIS_FAST_END_SILENCE_MS", 560)))
+            ),
+            long_utterance_threshold_ms=max(
+                1_000, int(env_float("JARVIS_LONG_UTTERANCE_THRESHOLD_MS", 3_000))
+            ),
+            fast_stt_max_speech_ms=max(
+                500, int(env_float("JARVIS_FAST_STT_MAX_SPEECH_MS", 3_500))
+            ),
+            vad_resume_chunks=max(1, int(env_float("JARVIS_VAD_RESUME_CHUNKS", 2))),
         )
 
 
@@ -148,7 +172,7 @@ class WakeWavRequest(BaseModel):
 class VoiceInputEngine:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.events: queue.Queue[dict[str, str]] = queue.Queue(maxsize=32)
+        self.events: queue.Queue[dict[str, object]] = queue.Queue(maxsize=32)
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -182,12 +206,19 @@ class VoiceInputEngine:
         self._level_history: deque[tuple[float, float]] = deque(maxlen=max(10, 10_000 // FRAME_MS))
         self._noise_history: deque[float] = deque(maxlen=max(25, 10_000 // FRAME_MS))
         self._vad_start_run = 0
+        self._vad_resume_run = 0
+        self._device: int | str | None = settings.device
+        self._hotkey_thread: threading.Thread | None = None
+        self._last_mic_end_unix_ms: int | None = None
 
     def start(self) -> None:
         if not self.settings.groq_api_key:
             raise RuntimeError("GROQ_API_KEY is required for Groq Whisper STT")
-        self._load_wake_model()
-        self._load_ukrainian_wake_model()
+        if self.settings.activation_mode == "wake":
+            self._load_wake_model()
+            self._load_ukrainian_wake_model()
+        elif self.settings.activation_mode not in {"hotkey", "api"}:
+            raise RuntimeError("JARVIS_ACTIVATION_MODE must be hotkey, api, or wake")
         self._log_audio_devices()
         self.settings.diagnostic_dir.mkdir(parents=True, exist_ok=True)
         LOGGER.info(
@@ -221,6 +252,11 @@ class VoiceInputEngine:
         )
         self._thread = threading.Thread(target=self._audio_loop, name="jarvis-microphone", daemon=True)
         self._thread.start()
+        if self.settings.activation_mode == "hotkey" and self.settings.hotkey_enabled:
+            self._hotkey_thread = threading.Thread(
+                target=self._hotkey_loop, name="jarvis-hotkey", daemon=True
+            )
+            self._hotkey_thread.start()
 
     def stop(self) -> None:
         self._stop.set()
@@ -239,6 +275,7 @@ class VoiceInputEngine:
             if not conversation_active:
                 self._reset_capture()
                 self._pre_roll.clear()
+                self._clear_events()
                 if self._vosk_recognizer is not None:
                     self._vosk_recognizer.Reset()
 
@@ -311,25 +348,61 @@ class VoiceInputEngine:
                 device["hostapi"],
             )
         try:
-            selected = sd.query_devices(self.settings.device, "input")
-            selected_index = self._resolve_selected_device_index(selected)
+            self._device = self._select_device(devices)
+            selected = sd.query_devices(self._device, "input")
+            selected_index = int(self._device) if isinstance(self._device, int) else self._resolve_selected_device_index(selected)
             self._selected_device = {
-                "requested": self.settings.device if self.settings.device is not None else "system default",
+                "requested": self.settings.device if self.settings.device is not None else "auto",
                 "index": selected_index,
                 "name": str(selected["name"]),
                 "max_input_channels": int(selected["max_input_channels"]),
                 "default_samplerate": float(selected["default_samplerate"]),
             }
-            sd.check_input_settings(device=self.settings.device, channels=1, dtype="int16", samplerate=SAMPLE_RATE)
+            sd.check_input_settings(device=self._device, channels=1, dtype="int16", samplerate=SAMPLE_RATE)
             LOGGER.info(
                 "Selected microphone: requested=%r resolved=[%s] %s; 16 kHz mono int16 supported",
-                self.settings.device if self.settings.device is not None else "system default",
+                self.settings.device if self.settings.device is not None else "auto",
                 selected_index,
                 selected["name"],
             )
         except Exception:
             LOGGER.exception("Selected microphone cannot open with the required 16 kHz mono format")
             raise
+
+    def _select_device(self, devices: list[dict[str, object]]) -> int | str:
+        """Resolve an explicit device or choose a real microphone, never loopback."""
+        if self.settings.device is not None:
+            if isinstance(self.settings.device, int):
+                if not any(item["index"] == self.settings.device for item in devices):
+                    raise RuntimeError(f"Configured microphone index {self.settings.device} does not exist")
+                return self.settings.device
+            needle = str(self.settings.device).casefold()
+            matches = [item for item in devices if needle in str(item["name"]).casefold()]
+            if len(matches) != 1:
+                names = ", ".join(f"[{item['index']}] {item['name']}" for item in matches) or "none"
+                raise RuntimeError(f"JARVIS_MIC_DEVICE must match exactly one input; matches: {names}")
+            return int(matches[0]["index"])
+
+        blocked = ("stereo mix", "loopback", "what u hear", "output", "мікшер", "стерео")
+        safe = [
+            item for item in devices
+            if not any(word in str(item["name"]).casefold() for word in blocked)
+        ]
+        default = next((item for item in safe if item["is_default"]), None)
+        if default is not None:
+            return int(default["index"])
+        preferred = next(
+            (
+                item for item in safe
+                if any(word in str(item["name"]).casefold() for word in ("microphone", "mic", "мікрофон"))
+            ),
+            None,
+        )
+        if preferred is not None:
+            return int(preferred["index"])
+        if safe:
+            return int(safe[0]["index"])
+        raise RuntimeError("No safe microphone input found; set JARVIS_MIC_DEVICE explicitly")
 
     @staticmethod
     def _resolve_selected_device_index(selected: object) -> int | None:
@@ -347,6 +420,9 @@ class VoiceInputEngine:
 
     def force_activate(self) -> None:
         with self._lock:
+            if self._speaking or self._stt_busy:
+                LOGGER.info("Activation ignored while TTS/STT is busy (half-duplex)")
+                return
             self._conversation_active = True
             self._speaking = False
             self._ignore_until = 0.0
@@ -356,6 +432,26 @@ class VoiceInputEngine:
             self._vosk_recognizer.Reset()
         LOGGER.info("Forced activation: wake detector bypassed; microphone -> VAD -> Whisper test is active")
         self._emit({"type": "wake"})
+
+    def _hotkey_loop(self) -> None:
+        """Windows global Ctrl+Alt+J fallback without a keyboard-hook package."""
+        if os.name != "nt":
+            LOGGER.warning("Global hotkey is only available on Windows; use POST /activate")
+            return
+        user32 = ctypes.windll.user32
+        hotkey_id = 0x4A17
+        modifiers = 0x0001 | 0x0002 | 0x4000  # ALT | CTRL | NOREPEAT
+        if not user32.RegisterHotKey(None, hotkey_id, modifiers, ord("J")):
+            LOGGER.warning("Could not register Ctrl+Alt+J; POST /activate remains available")
+            return
+        LOGGER.info("Activation ready: press Ctrl+Alt+J or call POST /activate")
+        message = ctypes.wintypes.MSG()
+        try:
+            while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+                if message.message == 0x0312 and message.wParam == hotkey_id:
+                    self.force_activate()
+        finally:
+            user32.UnregisterHotKey(None, hotkey_id)
 
     def _load_wake_model(self) -> None:
         from openwakeword.model import Model
@@ -411,16 +507,17 @@ class VoiceInputEngine:
             with sd.RawInputStream(
                 samplerate=SAMPLE_RATE,
                 blocksize=FRAME_SAMPLES,
-                device=self.settings.device,
+                device=self._device,
                 dtype="int16",
                 channels=1,
             ) as stream:
                 LOGGER.info(
-                    "Microphone stream opened: sample_rate=%s Hz channels=%s chunk=%s samples (%d ms); waiting for 'Джарвіс'",
+                    "Microphone stream opened: sample_rate=%s Hz channels=%s chunk=%s samples (%d ms); activation=%s",
                     getattr(stream, "samplerate", SAMPLE_RATE),
                     getattr(stream, "channels", 1),
                     getattr(stream, "blocksize", FRAME_SAMPLES),
                     FRAME_MS,
+                    self.settings.activation_mode,
                 )
                 while not self._stop.is_set():
                     frame, overflowed = stream.read(FRAME_SAMPLES)
@@ -446,6 +543,9 @@ class VoiceInputEngine:
         if not active:
             self._noise_history.append(rms)
             self._pre_roll.append(frame)
+            if self.settings.activation_mode != "wake":
+                self._log_levels_if_due(rms, peak, False)
+                return
             samples = np.frombuffer(frame, dtype=np.int16)
             with self._wake_lock:
                 predictions = self._wake_model.predict(samples)
@@ -501,7 +601,9 @@ class VoiceInputEngine:
         energy_pass = rms >= energy_threshold
         self._last_vad_raw = raw_speech
         self._last_energy_gate = energy_pass
-        candidate_speech = raw_speech and energy_pass
+        # Energy is the deterministic primary detector. WebRTC remains useful
+        # telemetry, but cannot discard Ukrainian speech on its own.
+        candidate_speech = energy_pass
         if not self._speech_seen and not energy_pass:
             # Continue adapting during an active conversation, but only from
             # frames still below the current energy threshold. This also works
@@ -512,13 +614,22 @@ class VoiceInputEngine:
             self._vad_start_run = self._vad_start_run + 1 if candidate_speech else 0
             speech = candidate_speech and self._vad_start_run >= self.settings.vad_start_chunks
         else:
-            speech = candidate_speech
+            if candidate_speech:
+                self._vad_resume_run += 1
+                speech = (
+                    self._silence_chunks == 0
+                    or self._vad_resume_run >= self.settings.vad_resume_chunks
+                )
+            else:
+                self._vad_resume_run = 0
+                speech = False
         previous_vad_state = self._last_vad_state
         self._last_vad_state = speech
         self._log_levels_if_due(rms, peak, speech)
         if self.settings.diagnostic and speech != previous_vad_state:
             LOGGER.info("VAD transition: %s", "SPEECH" if speech else "SILENCE")
         if speech:
+            self._last_mic_end_unix_ms = int(time.time() * 1_000)
             self._speech_chunks += 1
             self._consecutive_speech_chunks += 1
             self._silence_chunks = 0
@@ -553,7 +664,13 @@ class VoiceInputEngine:
         if self._speech_seen:
             self._capture.append(frame)
 
-        silence_limit = frames_for_ms(self.settings.silence_ms, minimum=1)
+        voiced_ms = self._speech_chunks * FRAME_MS
+        adaptive_silence_ms = (
+            min(self.settings.fast_silence_ms, self.settings.silence_ms)
+            if voiced_ms < self.settings.long_utterance_threshold_ms
+            else self.settings.silence_ms
+        )
+        silence_limit = frames_for_ms(adaptive_silence_ms, minimum=1)
         max_frames = max(1, int(self.settings.max_utterance_secs * 1_000 // FRAME_MS))
         if self._speech_seen and (self._silence_chunks >= silence_limit or len(self._capture) >= max_frames):
             raw_frames = list(self._capture)
@@ -565,13 +682,14 @@ class VoiceInputEngine:
             raw_ms = len(raw_frames) * FRAME_MS
             whisper_ms = len(whisper_frames) * FRAME_MS
             LOGGER.info(
-                "VAD recording END: reason=%s raw=%d ms whisper=%d ms voiced=%d ms trailing_silence=%d ms post_roll=%d ms",
+                "VAD recording END: reason=%s raw=%d ms whisper=%d ms voiced=%d ms trailing_silence=%d ms post_roll=%d ms adaptive_limit=%d ms",
                 end_reason,
                 raw_ms,
                 whisper_ms,
                 speech_ms,
                 self._silence_chunks * FRAME_MS,
                 post_roll_frames * FRAME_MS,
+                adaptive_silence_ms,
             )
             self._reset_capture()
             with self._lock:
@@ -651,6 +769,7 @@ class VoiceInputEngine:
         self._interrupt_sent = False
         self._capture_started_at = None
         self._vad_start_run = 0
+        self._vad_resume_run = 0
 
     def _transcribe(self, raw_frames: list[bytes], whisper_frames: list[bytes], speech_ms: int) -> None:
         try:
@@ -671,38 +790,78 @@ class VoiceInputEngine:
                 return
             wav = pcm_to_wav(pcm)
             self._save_diagnostic_wavs(raw_pcm, pcm)
+            selected_model = (
+                self.settings.fast_whisper_model
+                if speech_ms <= self.settings.fast_stt_max_speech_ms
+                else self.settings.whisper_model
+            )
             LOGGER.info(
                 "Whisper SEND: model=%s language=%s format=%s audio=%d ms RMS=%.4f (%.1f dBFS)",
-                self.settings.whisper_model,
+                selected_model,
                 self.settings.language,
                 self.settings.stt_response_format,
                 len(whisper_frames) * FRAME_MS,
                 rms,
                 dbfs(rms),
             )
-            response = requests.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {self.settings.groq_api_key}"},
-                files={"file": ("utterance.wav", wav, "audio/wav")},
-                data={
-                    "model": self.settings.whisper_model,
-                    "language": self.settings.language,
-                    "response_format": self.settings.stt_response_format,
-                    "timestamp_granularities[]": "segment",
-                    "temperature": "0",
-                    "prompt": self.settings.stt_prompt,
-                },
-                timeout=60,
-            )
-            response.raise_for_status()
+            models = [selected_model]
+            if selected_model != self.settings.whisper_model:
+                models.append(self.settings.whisper_model)
+            response = None
+            for attempt, model in enumerate(models):
+                try:
+                    response = requests.post(
+                        "https://api.groq.com/openai/v1/audio/transcriptions",
+                        headers={"Authorization": f"Bearer {self.settings.groq_api_key}"},
+                        files={"file": ("utterance.wav", wav, "audio/wav")},
+                        data={
+                            "model": model,
+                            "language": self.settings.language,
+                            "response_format": self.settings.stt_response_format,
+                            "timestamp_granularities[]": "segment",
+                            "temperature": "0",
+                            "prompt": self.settings.stt_prompt,
+                        },
+                        timeout=60,
+                    )
+                    response.raise_for_status()
+                    selected_model = model
+                    break
+                except requests.RequestException:
+                    if attempt + 1 == len(models):
+                        raise
+                    LOGGER.warning(
+                        "Fast Whisper model %s failed; retrying once with %s",
+                        model,
+                        self.settings.whisper_model,
+                        exc_info=True,
+                    )
+            assert response is not None
             payload = response.json()
             text = str(payload.get("text", "")).strip()
+            stt_done_unix_ms = int(time.time() * 1_000)
             metadata = {key: value for key, value in payload.items() if key != "text"}
-            self._last_transcript = {"text": text, "metadata": metadata, "received_at": time.time()}
+            rejected_reason = None
+            if speech_ms < 1_000 and is_common_whisper_hallucination(text):
+                rejected_reason = "common_whisper_hallucination_on_low_voiced_audio"
+            self._last_transcript = {
+                "text": text,
+                "metadata": metadata,
+                "received_at": time.time(),
+                "rejected_reason": rejected_reason,
+                "model": selected_model,
+            }
             LOGGER.info("Whisper transcript EXACT: %r", text)
             LOGGER.info("Whisper metadata: %s", json.dumps(metadata, ensure_ascii=False, separators=(",", ":")))
-            if text:
-                self._emit({"type": "transcript", "text": text})
+            if rejected_reason:
+                LOGGER.warning("Transcript rejected: %s", rejected_reason)
+            elif text:
+                self._emit({
+                    "type": "transcript",
+                    "text": text,
+                    "mic_end_unix_ms": self._last_mic_end_unix_ms,
+                    "stt_done_unix_ms": stt_done_unix_ms,
+                })
         except Exception as error:
             LOGGER.exception("Groq Whisper request failed")
             self._emit({"type": "error", "message": f"Groq Whisper не відповів: {error}"})
@@ -792,7 +951,7 @@ class VoiceInputEngine:
         LOGGER.info("Wake WAV measurement: %s", json.dumps(result, ensure_ascii=False, separators=(",", ":")))
         return result
 
-    def _emit(self, event: dict[str, str]) -> None:
+    def _emit(self, event: dict[str, object]) -> None:
         try:
             self.events.put_nowait(event)
         except queue.Full:
@@ -801,6 +960,13 @@ class VoiceInputEngine:
             except queue.Empty:
                 pass
             self.events.put_nowait(event)
+
+    def _clear_events(self) -> None:
+        while True:
+            try:
+                self.events.get_nowait()
+            except queue.Empty:
+                return
 
 
 def pcm_to_wav(pcm: bytes) -> bytes:
@@ -871,6 +1037,15 @@ def contains_wake_word(
     )
 
 
+def is_common_whisper_hallucination(text: str) -> bool:
+    normalized = re.sub(r"[^\w]+", " ", text.casefold(), flags=re.UNICODE).strip()
+    return normalized in {
+        "дякую за перегляд",
+        "продовження буде",
+        "субтитри зроблені спільнотою amara org",
+    }
+
+
 settings = Settings.from_environment()
 engine = VoiceInputEngine(settings)
 
@@ -907,13 +1082,21 @@ def diagnostics() -> dict[str, object]:
         "vad_energy_ratio": settings.vad_energy_ratio,
         "vad_energy_delta": settings.vad_energy_delta,
         "vad_start_chunks": settings.vad_start_chunks,
+        "vad_resume_chunks": settings.vad_resume_chunks,
         "pre_roll_ms": settings.pre_roll_ms,
         "post_roll_ms": settings.post_roll_ms,
         "end_silence_ms": settings.silence_ms,
+        "fast_end_silence_ms": settings.fast_silence_ms,
+        "long_utterance_threshold_ms": settings.long_utterance_threshold_ms,
+        "fast_whisper_model": settings.fast_whisper_model,
+        "long_whisper_model": settings.whisper_model,
+        "fast_stt_max_speech_ms": settings.fast_stt_max_speech_ms,
         "wake_threshold": settings.wake_threshold,
         "wake_variants": settings.wake_variants,
         "wake_vosk_max_edit_distance": settings.wake_vosk_max_edit_distance,
         "barge_in_enabled": settings.barge_in_enabled,
+        "activation_mode": settings.activation_mode,
+        "hotkey": "Ctrl+Alt+J" if settings.activation_mode == "hotkey" else None,
         "last_raw_wav": str(settings.diagnostic_dir / "last_raw.wav"),
         "last_whisper_wav": str(settings.diagnostic_dir / "last_whisper.wav"),
     }
@@ -926,7 +1109,7 @@ def set_state(request: StateRequest) -> dict[str, object]:
 
 
 @app.get("/events/next")
-async def next_event(timeout: float = 30.0) -> dict[str, str]:
+async def next_event(timeout: float = 30.0) -> dict[str, object]:
     """Cancellation-friendly long poll so Ctrl+C can stop Uvicorn cleanly."""
     deadline = time.monotonic() + max(0.1, min(timeout, 30.0))
     while time.monotonic() < deadline:

@@ -3,3 +3,5 @@ uvicorn==0.52.4
 piper-tts==1.7.0
 pedalboard==0.9.24
 numpy==2.4.3
+requests==2.32.5
+python-dotenv==1.1.1

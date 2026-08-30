@@ -16,9 +16,9 @@ $phrases = @(
 
 foreach ($index in 0..($phrases.Count - 1)) {
     $pair = @()
-    foreach ($mode in @('raw', 'jarvis_reference')) {
-        $output = Join-Path $PSScriptRoot ("test_{0}_{1}.wav" -f ($index + 1), $mode)
-        $body = @{ text = $phrases[$index]; mode = $mode } | ConvertTo-Json -Compress
+    foreach ($provider in @('fish', 'piper')) {
+        $output = Join-Path $PSScriptRoot ("test_{0}_{1}.wav" -f ($index + 1), $provider)
+        $body = @{ text = $phrases[$index]; provider = $provider } | ConvertTo-Json -Compress
         $response = Invoke-WebRequest `
             -Uri "$BaseUrl/synthesize" `
             -Method Post `
@@ -29,10 +29,11 @@ foreach ($index in 0..($phrases.Count - 1)) {
 
         $wav = Get-Item -LiteralPath $output
         if ($wav.Length -le 44) {
-            throw "The service returned an empty WAV file for mode '$mode'."
+            throw "The service returned an empty WAV file for provider '$provider'."
         }
-        $responseMode = $response.Headers['X-Jarvis-Mode'] -join ''
-        Write-Host ("Created {0}: {1} bytes, mode={2}" -f $wav.Name, $wav.Length, $responseMode)
+        $actualProvider = $response.Headers['X-Jarvis-Provider'] -join ''
+        $cache = $response.Headers['X-Jarvis-Cache'] -join ''
+        Write-Host ("Created {0}: {1} bytes, provider={2}, cache={3}" -f $wav.Name, $wav.Length, $actualProvider, $cache)
         $pair += $output
     }
     if ($Play) {
@@ -42,4 +43,4 @@ foreach ($index in 0..($phrases.Count - 1)) {
         }
     }
 }
-Write-Host 'A/B files are ready. Compare test_1_raw.wav with test_1_jarvis_reference.wav first.'
+Write-Host 'A/B files are ready. Compare test_1_fish.wav with test_1_piper.wav first.'

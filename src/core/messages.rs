@@ -39,6 +39,10 @@ impl Message {
         Self::text("user", text)
     }
 
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self::text("assistant", text)
+    }
+
     pub fn tool(tool_call_id: impl Into<String>, result: impl Into<String>) -> Self {
         Self {
             role: "tool".to_owned(),

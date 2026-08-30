@@ -2,11 +2,12 @@ use std::{
     error::Error,
     io,
     io::Write,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
     ai::GroqClient,
+    core::fast_command::match_fast_command,
     core::messages::Message,
     tools::ToolRegistry,
     voice::{PlaybackCancellation, VoiceClient},
@@ -113,7 +114,7 @@ impl Agent {
     }
 
     async fn run_voice(&mut self, input: VoiceInputClient) -> Result<(), Box<dyn Error>> {
-        println!("Голосовий режим активний. Скажіть «Джарвіс». Ctrl+C — аварійний вихід.\n");
+        println!("Голосовий режим активний. Натисніть Ctrl+Alt+J. Ctrl+C — аварійний вихід.\n");
         input.set_state(false, false).await?;
         let mut conversation_deadline: Option<Instant> = None;
 
@@ -126,7 +127,7 @@ impl Agent {
             if wait.is_zero() {
                 conversation_deadline = None;
                 input.set_state(false, false).await?;
-                println!("[Voice Input] Розмовну сесію завершено. Скажіть «Джарвіс».");
+                println!("[Voice Input] Розмовну сесію завершено. Натисніть Ctrl+Alt+J.");
                 continue;
             }
 
@@ -158,12 +159,68 @@ impl Agent {
                     }
                     input.set_state(true, false).await?;
                 }
-                VoiceEvent::Transcript { text } => {
+                VoiceEvent::Transcript {
+                    text,
+                    mic_end_unix_ms,
+                    stt_done_unix_ms,
+                } => {
                     let text = clean_wake_word(&text);
                     if text.is_empty() {
                         continue;
                     }
                     println!("Ви: {text}");
+                    if let Some(command) = match_fast_command(&text) {
+                        let intent_at = unix_ms();
+                        let tool_start = unix_ms();
+                        let tools = self.tools.clone();
+                        let intent = command.intent;
+                        let arguments = command.arguments.clone();
+                        // The tool starts on a blocking worker immediately. In
+                        // parallel, the existing sidecar contract closes the
+                        // microphone for half-duplex execution/TTS.
+                        let tool_task =
+                            tokio::task::spawn_blocking(move || tools.execute(intent, &arguments));
+                        input.set_state(true, true).await?;
+                        let result = tool_task.await.map_err(io::Error::other)?;
+                        let tool_done = unix_ms();
+                        let answer = fast_answer(command.intent, &result, command.acknowledgement);
+                        self.history.push(Message::user(&text));
+                        self.history.push(Message::assistant(&answer));
+                        println!(
+                            "[Fast Path] intent={} args={}",
+                            command.intent, command.arguments
+                        );
+                        println!("\nJARVIS: {answer}\n");
+                        conversation_deadline = Some(Instant::now() + self.conversation_timeout);
+
+                        let tts_start = self.voice.as_ref().map(|_| unix_ms());
+                        log_fast_latency(
+                            mic_end_unix_ms,
+                            stt_done_unix_ms,
+                            intent_at,
+                            tool_start,
+                            tool_done,
+                            tts_start,
+                        );
+
+                        if let Some(voice) = self.voice.clone() {
+                            match self.speak_with_barge_in(&input, &voice, &answer).await {
+                                PlaybackOutcome::Transcript(interrupted_text)
+                                    if !interrupted_text.is_empty() =>
+                                {
+                                    println!("Ви (перебивання): {interrupted_text}");
+                                }
+                                PlaybackOutcome::Stopped => return self.run_text().await,
+                                PlaybackOutcome::Completed | PlaybackOutcome::Transcript(_) => {}
+                            }
+                        } else {
+                            input.set_state(true, false).await?;
+                        }
+                        continue;
+                    }
+                    // LLM fallback keeps the microphone closed while the agent
+                    // thinks and performs tools, not only during audible TTS.
+                    input.set_state(true, true).await?;
                     match self.respond(&text).await {
                         Ok(answer) => {
                             println!("\nJARVIS: {answer}\n");
@@ -175,6 +232,7 @@ impl Agent {
                                         if !interrupted_text.is_empty() =>
                                     {
                                         println!("Ви (перебивання): {interrupted_text}");
+                                        input.set_state(true, true).await?;
                                         match self.respond(&interrupted_text).await {
                                             Ok(new_answer) => {
                                                 println!("\nJARVIS: {new_answer}\n");
@@ -204,9 +262,14 @@ impl Agent {
                                     PlaybackOutcome::Completed | PlaybackOutcome::Transcript(_) => {
                                     }
                                 }
+                            } else {
+                                input.set_state(true, false).await?;
                             }
                         }
-                        Err(error) => eprintln!("\nJARVIS: Сталася помилка: {error}\n"),
+                        Err(error) => {
+                            eprintln!("\nJARVIS: Сталася помилка: {error}\n");
+                            input.set_state(true, false).await?;
+                        }
                     }
                 }
                 VoiceEvent::Error { message } => eprintln!("[Voice Input] {message}"),
@@ -228,9 +291,6 @@ impl Agent {
         voice: &VoiceClient,
         answer: &str,
     ) -> PlaybackOutcome {
-        if let Err(error) = input.set_state(true, true).await {
-            eprintln!("[Voice Input] Не вдалося ввімкнути barge-in: {error}");
-        }
         let cancellation = PlaybackCancellation::default();
         let playback = voice.speak_cancellable(answer, cancellation.clone());
         tokio::pin!(playback);
@@ -248,7 +308,7 @@ impl Agent {
                         interrupted = true;
                         cancellation.cancel();
                     }
-                    Ok(VoiceEvent::Transcript { text }) => {
+                    Ok(VoiceEvent::Transcript { text, .. }) => {
                         cancellation.cancel();
                         outcome = PlaybackOutcome::Transcript(clean_wake_word(&text));
                         break;
@@ -317,6 +377,77 @@ fn clean_wake_word(text: &str) -> String {
         }
     }
     trimmed.to_owned()
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn elapsed_ms(start: Option<u64>, end: Option<u64>) -> Option<u64> {
+    Some(end?.saturating_sub(start?))
+}
+
+fn log_fast_latency(
+    mic_end: Option<u64>,
+    stt_done: Option<u64>,
+    intent_at: u64,
+    tool_start: u64,
+    tool_done: u64,
+    tts_start: Option<u64>,
+) {
+    let total_end = tts_start.unwrap_or(tool_done);
+    println!(
+        "[Latency] fast_path=true mic_end->stt_done={} stt_done->intent={} intent->tool_start={} tool_start->tool_done={} tool_done->tts_start={} total={} ms",
+        metric(elapsed_ms(mic_end, stt_done)),
+        metric(elapsed_ms(stt_done, Some(intent_at))),
+        metric(elapsed_ms(Some(intent_at), Some(tool_start))),
+        metric(elapsed_ms(Some(tool_start), Some(tool_done))),
+        metric(elapsed_ms(Some(tool_done), tts_start)),
+        metric(elapsed_ms(mic_end, Some(total_end))),
+    );
+}
+
+fn metric(value: Option<u64>) -> String {
+    value.map_or_else(|| "n/a".to_owned(), |value| value.to_string())
+}
+
+fn fast_answer(intent: &str, result: &str, acknowledgement: &str) -> String {
+    let payload: serde_json::Value = match serde_json::from_str(result) {
+        Ok(payload) => payload,
+        Err(_) => return acknowledgement.to_owned(),
+    };
+    if payload.get("success").and_then(serde_json::Value::as_bool) == Some(true) {
+        if intent == "get_running_apps"
+            && let Some(raw_apps) = payload.get("result").and_then(serde_json::Value::as_str)
+            && let Ok(apps) = serde_json::from_str::<serde_json::Value>(raw_apps)
+        {
+            let items = apps.as_array().cloned().unwrap_or_else(|| vec![apps]);
+            let mut names = Vec::new();
+            for item in items {
+                if let Some(name) = item.get("name").and_then(serde_json::Value::as_str)
+                    && !names.iter().any(|existing| existing == name)
+                {
+                    names.push(name.to_owned());
+                }
+                if names.len() == 8 {
+                    break;
+                }
+            }
+            if !names.is_empty() {
+                return format!("Запущені програми: {}.", names.join(", "));
+            }
+        }
+        acknowledgement.to_owned()
+    } else {
+        payload
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Не вдалося виконати команду.")
+            .to_owned()
+    }
 }
 
 #[cfg(test)]

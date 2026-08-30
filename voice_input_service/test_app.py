@@ -1,4 +1,5 @@
 import io
+import inspect
 import os
 import tempfile
 import unittest
@@ -17,8 +18,10 @@ from app import (
     VoiceInputEngine,
     contains_wake_word,
     frames_for_ms,
+    is_common_whisper_hallucination,
     pcm_to_wav,
     read_pcm_wav,
+    next_event,
 )
 
 
@@ -30,21 +33,35 @@ def test_settings() -> Settings:
 
 
 class VoiceInputTests(unittest.TestCase):
+    def test_event_endpoint_accepts_numeric_latency_metadata(self):
+        annotation = inspect.signature(next_event).return_annotation
+        self.assertEqual(annotation, "dict[str, object]")
+
     def test_environment_defaults_match_stable_voice_profile(self):
         with patch.dict(os.environ, {"GROQ_API_KEY": "key"}, clear=True):
             settings = Settings.from_environment()
         self.assertEqual(settings.vad_aggressiveness, 1)
         self.assertEqual(settings.vad_energy_ratio, 1.10)
         self.assertEqual(settings.vad_energy_delta, 0.004)
-        self.assertEqual(settings.vad_start_chunks, 1)
+        self.assertEqual(settings.vad_start_chunks, 2)
+        self.assertEqual(settings.vad_resume_chunks, 2)
         self.assertEqual(settings.pre_roll_ms, 560)
         self.assertEqual(settings.post_roll_ms, 480)
         self.assertEqual(settings.silence_ms, 1200)
+        self.assertEqual(settings.fast_silence_ms, 560)
+        self.assertEqual(settings.fast_whisper_model, "whisper-large-v3-turbo")
+        self.assertEqual(settings.long_utterance_threshold_ms, 3000)
         self.assertEqual(settings.min_speech_ms, 300)
         self.assertEqual(settings.min_audio_rms, 0.0015)
-        self.assertEqual(settings.post_tts_guard_ms, 250)
+        self.assertEqual(settings.post_tts_guard_ms, 800)
         self.assertFalse(settings.barge_in_enabled)
         self.assertEqual(settings.wake_vosk_max_edit_distance, 1)
+
+    def test_deactivation_drops_stale_events(self):
+        engine = VoiceInputEngine(test_settings())
+        engine.events.put_nowait({"type": "transcript", "text": "stale"})
+        engine.set_state(False, False)
+        self.assertTrue(engine.events.empty())
 
     def test_pcm_to_wav_contract(self):
         payload = pcm_to_wav(np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes())
@@ -52,6 +69,10 @@ class VoiceInputTests(unittest.TestCase):
             self.assertEqual(wav.getframerate(), SAMPLE_RATE)
             self.assertEqual(wav.getnchannels(), 1)
             self.assertEqual(wav.getsampwidth(), 2)
+
+    def test_common_low_audio_whisper_hallucination_is_recognized(self):
+        self.assertTrue(is_common_whisper_hallucination("Дякую за перегляд!"))
+        self.assertFalse(is_common_whisper_hallucination("Відкрий YouTube"))
 
     def test_diagnostic_saves_raw_and_actual_whisper_wav(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -64,7 +85,7 @@ class VoiceInputTests(unittest.TestCase):
             self.assertEqual(read_pcm_wav(Path(directory) / "last_whisper.wav"), whisper_pcm)
 
     def test_wake_event_switches_to_active_mode(self):
-        engine = VoiceInputEngine(test_settings())
+        engine = VoiceInputEngine(replace(test_settings(), activation_mode="wake"))
         engine._wake_model = Mock()
         engine._wake_model.models = {"hey_jarvis": object()}
         engine._wake_model.predict.return_value = {"hey_jarvis": 0.9}
@@ -138,6 +159,63 @@ class VoiceInputTests(unittest.TestCase):
         self.assertEqual(frames_for_ms(1), 1)
         self.assertEqual(frames_for_ms(80), 1)
         self.assertEqual(frames_for_ms(81), 2)
+
+    def test_short_capture_uses_fast_adaptive_end_silence(self):
+        settings = replace(test_settings(), silence_ms=1200, fast_silence_ms=560)
+        engine = VoiceInputEngine(settings)
+        engine.set_state(True, False)
+        speech = np.full(FRAME_SAMPLES, 12000, dtype=np.int16).tobytes()
+        silence = np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes()
+        with patch.object(engine, "_is_speech", side_effect=[True] + [False] * 7), \
+             patch.object(engine, "_transcribe") as transcribe:
+            for frame in [speech] + [silence] * 7:
+                engine.process_frame(frame)
+            for _ in range(20):
+                if transcribe.called:
+                    break
+                __import__("time").sleep(0.01)
+            self.assertTrue(transcribe.called)
+
+    def test_single_noise_spike_does_not_restart_end_silence_timer(self):
+        settings = replace(
+            test_settings(),
+            silence_ms=560,
+            fast_silence_ms=560,
+            vad_resume_chunks=2,
+        )
+        engine = VoiceInputEngine(settings)
+        engine.set_state(True, False)
+        speech = np.full(FRAME_SAMPLES, 12000, dtype=np.int16).tobytes()
+        silence = np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes()
+        frames = [speech, silence, silence, silence, speech, silence, silence, silence]
+        decisions = [True, False, False, False, True, False, False, False]
+        with patch.object(engine, "_is_speech", side_effect=decisions), \
+             patch.object(engine, "_transcribe") as transcribe:
+            for frame in frames:
+                engine.process_frame(frame)
+            for _ in range(20):
+                if transcribe.called:
+                    break
+                __import__("time").sleep(0.01)
+            self.assertTrue(transcribe.called)
+
+    def test_short_audio_uses_turbo_stt_and_emits_compatible_transcript(self):
+        engine = VoiceInputEngine(test_settings())
+        frame = np.full(FRAME_SAMPLES, 12000, dtype=np.int16).tobytes()
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"text": "Відкрий калькулятор"}
+        with patch("app.requests.post", return_value=response) as post:
+            engine._transcribe([frame] * 5, [frame] * 5, 400)
+        self.assertEqual(
+            post.call_args.kwargs["data"]["model"],
+            "whisper-large-v3-turbo",
+        )
+        event = engine.events.get_nowait()
+        self.assertEqual(event["type"], "transcript")
+        self.assertEqual(event["text"], "Відкрий калькулятор")
+        self.assertIn("mic_end_unix_ms", event)
+        self.assertIn("stt_done_unix_ms", event)
 
     def test_active_session_updates_noise_floor_below_gate_even_if_webrtc_says_speech(self):
         engine = VoiceInputEngine(test_settings())

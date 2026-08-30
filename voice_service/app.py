@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import threading
+import time
 import urllib.request
 import wave
 from contextlib import asynccontextmanager
@@ -14,6 +15,8 @@ from pathlib import Path
 from typing import Literal, TypeAlias
 
 import numpy as np
+import requests
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
@@ -23,11 +26,14 @@ from pydantic import BaseModel, Field
 
 logging.basicConfig(level=os.getenv("JARVIS_TTS_LOG_LEVEL", "INFO"))
 LOGGER = logging.getLogger("jarvis.voice")
+SERVICE_ROOT = Path(__file__).resolve().parent
+load_dotenv(SERVICE_ROOT.parent / ".env")
 MODEL_ID = "uk_UA-mykyta-high"
 MODEL_FILENAME = f"{MODEL_ID}.onnx"
 MODEL_SHA256 = "081d253cd246d7d4d698c6dd147b74cad498dafd213527887a3a490519138243"
 MODEL_BASE_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/uk/uk_UA/mykyta/high"
 VoiceMode: TypeAlias = Literal["raw", "jarvis", "jarvis_reference"]
+ProviderMode: TypeAlias = Literal["auto", "fish", "piper"]
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -42,6 +48,7 @@ class SynthesisRequest(BaseModel):
     speed: float | None = Field(default=None, ge=0.75, le=1.5)
     mode: VoiceMode | None = None
     fx_enabled: bool | None = None
+    provider: ProviderMode | None = None
 
 
 @dataclass(frozen=True)
@@ -51,6 +58,9 @@ class VoiceSettings:
     sample_rate: int | None
     default_mode: VoiceMode
     fx_enabled: bool
+    provider: ProviderMode
+    cache_dir: Path
+    cache_max_chars: int
 
     @classmethod
     def from_environment(cls) -> "VoiceSettings":
@@ -61,13 +71,83 @@ class VoiceSettings:
         sample_rate = None if sample_rate_text in {"", "native"} else int(sample_rate_text)
         if sample_rate is not None and not 8_000 <= sample_rate <= 48_000:
             raise ValueError("JARVIS_TTS_SAMPLE_RATE must be native or 8000..48000")
+        provider = os.getenv("JARVIS_TTS_PROVIDER", "auto").strip().lower()
+        if provider not in {"auto", "fish", "piper"}:
+            raise ValueError("JARVIS_TTS_PROVIDER must be 'auto', 'fish', or 'piper'")
         return cls(
             model_dir=Path(os.getenv("JARVIS_TTS_MODEL_DIR", str(Path(__file__).parent / "models"))),
             speed=float(os.getenv("JARVIS_TTS_SPEED", "1.03")),
             sample_rate=sample_rate,
             default_mode=mode,  # type: ignore[arg-type]
             fx_enabled=env_bool("JARVIS_FX_ENABLED", True),
+            provider=provider,  # type: ignore[arg-type]
+            cache_dir=Path(os.getenv("JARVIS_TTS_CACHE_DIR", str(SERVICE_ROOT / "cache"))),
+            cache_max_chars=int(os.getenv("JARVIS_TTS_CACHE_MAX_CHARS", "120")),
         )
+
+
+@dataclass(frozen=True)
+class FishAudioSettings:
+    api_key: str
+    reference_id: str
+    model: str
+    fallback_model: str
+    endpoint: str
+    latency: str
+    connect_timeout: float
+    read_timeout: float
+    retries: int
+    retry_delay: float
+    fx_enabled: bool
+
+    @classmethod
+    def from_environment(cls) -> "FishAudioSettings":
+        latency = os.getenv("FISH_AUDIO_LATENCY", "low").strip().lower()
+        if latency not in {"low", "balanced", "normal"}:
+            raise ValueError("FISH_AUDIO_LATENCY must be low, balanced, or normal")
+        return cls(
+            api_key=os.getenv("FISH_AUDIO_API_KEY", "").strip(),
+            reference_id=(os.getenv("FISH_AUDIO_REFERENCE_ID") or os.getenv("FISH_AUDIO_VOICE_ID") or "").strip(),
+            model=os.getenv("FISH_AUDIO_MODEL", "s2.1-pro-free").strip() or "s2.1-pro-free",
+            fallback_model=os.getenv("FISH_AUDIO_FALLBACK_MODEL", "s2-pro").strip() or "s2-pro",
+            endpoint=os.getenv("FISH_AUDIO_TTS_URL", "https://api.fish.audio/v1/tts").strip(),
+            latency=latency,
+            connect_timeout=float(os.getenv("FISH_AUDIO_CONNECT_TIMEOUT_SECS", "2.5")),
+            read_timeout=float(os.getenv("FISH_AUDIO_READ_TIMEOUT_SECS", "12")),
+            retries=max(0, int(os.getenv("FISH_AUDIO_RETRIES", "1"))),
+            retry_delay=max(0.0, float(os.getenv("FISH_AUDIO_RETRY_DELAY_SECS", "0.25"))),
+            fx_enabled=env_bool("FISH_AUDIO_FX_ENABLED", False),
+        )
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key and self.reference_id)
+
+    @property
+    def unavailable_reason(self) -> str | None:
+        if not self.api_key:
+            return "missing_api_key"
+        if not self.reference_id:
+            return "missing_reference_id"
+        return None
+
+
+@dataclass(frozen=True)
+class SynthesisResult:
+    audio: bytes
+    provider: str
+    model: str
+    reference: str | None
+    mode: str
+    sample_rate: int
+    cache_hit: bool = False
+    fallback_from: str | None = None
+
+
+class FishAudioError(RuntimeError):
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -202,6 +282,266 @@ class PiperVoiceService:
         return encode_wav(audio, sample_rate), "jarvis_reference" if use_fx else "raw", sample_rate
 
 
+class FishAudioService:
+    """Low-latency Fish Audio client. The API key is never exposed in status or logs."""
+
+    _MODEL_REJECTION_STATUS = {400, 422}
+
+    def __init__(self, settings: FishAudioSettings, fx: JarvisFx) -> None:
+        self.settings = settings
+        self.fx = fx
+        self.effective_model = settings.model
+        self._session = requests.Session()
+        self._model_lock = threading.Lock()
+
+    def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+        if not self.settings.configured:
+            raise FishAudioError(self.settings.unavailable_reason or "fish_not_configured")
+
+        model = self.effective_model
+        try:
+            audio = self._request_audio(request, model)
+        except FishAudioError as error:
+            # The free model is time-limited. If Fish explicitly rejects that model,
+            # retry once with the current model recommended by the official API docs.
+            if (
+                error.status_code in self._MODEL_REJECTION_STATUS
+                and model == "s2.1-pro-free"
+                and self.settings.fallback_model
+                and self.settings.fallback_model != model
+            ):
+                audio = self._request_audio(request, self.settings.fallback_model)
+                with self._model_lock:
+                    self.effective_model = self.settings.fallback_model
+                model = self.settings.fallback_model
+            else:
+                raise
+
+        sample_rate = wav_sample_rate(audio)
+        mode = "raw"
+        if self.settings.fx_enabled:
+            decoded, sample_rate = decode_wav(audio)
+            audio = encode_wav(self.fx.process(decoded, sample_rate, 1.0), sample_rate)
+            mode = "fish_fx"
+        return SynthesisResult(
+            audio=audio,
+            provider="fish",
+            model=model,
+            reference=masked_reference(self.settings.reference_id),
+            mode=mode,
+            sample_rate=sample_rate,
+        )
+
+    def _request_audio(self, request: SynthesisRequest, model: str) -> bytes:
+        payload: dict[str, object] = {
+            "text": request.text.strip(),
+            "reference_id": self.settings.reference_id,
+            "format": "wav",
+            "latency": self.settings.latency,
+            "prosody": {"speed": request.speed or 1.0, "volume": 0, "normalize_loudness": True},
+        }
+        # Fish accepts only a fixed set of WAV sample rates. Omit unsupported
+        # values and let the API use its documented 44.1 kHz default.
+        if request.sample_rate in {8_000, 16_000, 24_000, 32_000, 44_100}:
+            payload["sample_rate"] = request.sample_rate
+        headers = {
+            "Authorization": f"Bearer {self.settings.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "audio/wav",
+            "model": model,
+        }
+        attempts = self.settings.retries + 1
+        last_error: FishAudioError | None = None
+        for attempt in range(attempts):
+            try:
+                with self._session.post(
+                    self.settings.endpoint,
+                    headers=headers,
+                    json=payload,
+                    stream=True,
+                    timeout=(self.settings.connect_timeout, self.settings.read_timeout),
+                ) as response:
+                    if response.status_code != 200:
+                        error = FishAudioError(
+                            f"Fish Audio returned HTTP {response.status_code}",
+                            response.status_code,
+                        )
+                        retryable = response.status_code == 429 or response.status_code >= 500
+                        if not retryable or attempt + 1 >= attempts:
+                            raise error
+                        last_error = error
+                    else:
+                        chunks = bytearray()
+                        for chunk in response.iter_content(chunk_size=16 * 1024):
+                            if chunk:
+                                chunks.extend(chunk)
+                        audio = bytes(chunks)
+                        try:
+                            validate_wav(audio)
+                        except (ValueError, wave.Error) as error:
+                            raise FishAudioError("Fish Audio returned invalid WAV audio") from error
+                        return audio
+            except requests.RequestException as error:
+                last_error = FishAudioError(f"Fish Audio network failure: {type(error).__name__}")
+                if attempt + 1 >= attempts:
+                    raise last_error from error
+            if self.settings.retry_delay:
+                time.sleep(self.settings.retry_delay * (attempt + 1))
+        raise last_error or FishAudioError("Fish Audio request failed")
+
+
+class AudioCache:
+    def __init__(self, root: Path, max_chars: int) -> None:
+        self.root = root
+        self.max_chars = max_chars
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def key(self, provider: str, model: str, reference: str, request: SynthesisRequest) -> str | None:
+        text = " ".join(request.text.split())
+        if not text or len(text) > self.max_chars:
+            return None
+        material = "\n".join([
+            "v2", provider, model, reference, text,
+            str(request.speed or "default"), str(request.sample_rate or "native"),
+        ])
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def read(self, key: str | None) -> bytes | None:
+        if key is None:
+            return None
+        path = self.root / f"{key}.wav"
+        try:
+            audio = path.read_bytes()
+            validate_wav(audio)
+            return audio
+        except (FileNotFoundError, OSError, ValueError, wave.Error):
+            return None
+
+    def write(self, key: str | None, audio: bytes) -> None:
+        if key is None:
+            return
+        path = self.root / f"{key}.wav"
+        temporary = path.with_suffix(".wav.tmp")
+        temporary.write_bytes(audio)
+        temporary.replace(path)
+
+
+class VoiceRouter:
+    def __init__(
+        self,
+        settings: VoiceSettings,
+        fish: FishAudioService,
+        piper: PiperVoiceService,
+        cache: AudioCache,
+    ) -> None:
+        self.settings = settings
+        self.fish = fish
+        self.piper = piper
+        self.cache = cache
+        self.last_provider = "piper"
+        self.last_error: str | None = None
+        self._state_lock = threading.Lock()
+
+    def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+        requested = request.provider or self.settings.provider
+        use_fish = requested in {"auto", "fish"} and self.fish.settings.configured
+        if use_fish:
+            model = self.fish.effective_model
+            fish_cache_provider = "fish_fx" if self.fish.settings.fx_enabled else "fish"
+            cache_key = self.cache.key(fish_cache_provider, model, self.fish.settings.reference_id, request)
+            cached = self.cache.read(cache_key)
+            if cached is not None:
+                result = SynthesisResult(
+                    cached, "fish", model, masked_reference(self.fish.settings.reference_id),
+                    "fish_fx" if self.fish.settings.fx_enabled else "raw",
+                    wav_sample_rate(cached), cache_hit=True,
+                )
+                self._remember(result.provider, None)
+                return result
+            try:
+                result = self.fish.synthesize(request)
+                # The negotiated model can differ when the free model has expired.
+                final_key = self.cache.key(fish_cache_provider, result.model, self.fish.settings.reference_id, request)
+                self.cache.write(final_key, result.audio)
+                self._remember(result.provider, None)
+                return result
+            except FishAudioError as error:
+                self._remember("piper", safe_error(error))
+                LOGGER.warning("Fish Audio unavailable; using local Piper fallback (%s)", safe_error(error))
+                return self._piper_result(request, fallback_from="fish")
+        if requested == "fish" and not self.fish.settings.configured:
+            self._remember("piper", self.fish.settings.unavailable_reason)
+        return self._piper_result(request, fallback_from="fish" if requested == "fish" else None)
+
+    def _piper_result(self, request: SynthesisRequest, fallback_from: str | None = None) -> SynthesisResult:
+        audio, mode, sample_rate = self.piper.synthesize(request)
+        result = SynthesisResult(
+            audio, "piper", MODEL_ID, "mykyta", mode, sample_rate,
+            fallback_from=fallback_from,
+        )
+        self._remember("piper", self.last_error if fallback_from else None)
+        return result
+
+    def _remember(self, provider: str, error: str | None) -> None:
+        with self._state_lock:
+            self.last_provider = provider
+            self.last_error = error
+
+    def prewarm(self) -> None:
+        if self.settings.provider != "auto" or not self.fish.settings.configured:
+            return
+        phrases = [
+            "До ваших послуг, пане.",
+            "Завдання виконано.",
+            "Готово.",
+        ]
+        for text in phrases:
+            try:
+                self.synthesize(SynthesisRequest(text=text, provider="fish"))
+            except Exception as error:
+                LOGGER.warning("Fish Audio cache prewarm stopped (%s)", safe_error(error))
+                break
+
+
+def validate_wav(audio: bytes) -> None:
+    if len(audio) <= 44 or audio[:4] not in {b"RIFF", b"RF64"} or audio[8:12] != b"WAVE":
+        raise ValueError("TTS provider returned invalid WAV audio")
+    with wave.open(io.BytesIO(audio), "rb") as wav:
+        if wav.getnframes() <= 0:
+            raise ValueError("TTS provider returned an empty WAV")
+
+
+def wav_sample_rate(audio: bytes) -> int:
+    with wave.open(io.BytesIO(audio), "rb") as wav:
+        return wav.getframerate()
+
+
+def decode_wav(audio: bytes) -> tuple[np.ndarray, int]:
+    with wave.open(io.BytesIO(audio), "rb") as wav:
+        if wav.getsampwidth() != 2:
+            raise ValueError("Only 16-bit PCM WAV is supported for optional Fish FX")
+        channels = wav.getnchannels()
+        sample_rate = wav.getframerate()
+        frames = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
+    if channels > 1:
+        frames = frames.reshape(-1, channels).mean(axis=1)
+    return frames, sample_rate
+
+
+def masked_reference(reference_id: str) -> str | None:
+    if not reference_id:
+        return None
+    if len(reference_id) <= 8:
+        return "configured"
+    return f"{reference_id[:4]}...{reference_id[-4:]}"
+
+
+def safe_error(error: BaseException) -> str:
+    if isinstance(error, FishAudioError) and error.status_code is not None:
+        return f"http_{error.status_code}"
+    return type(error).__name__
+
+
 def resample_to_length(audio: np.ndarray, target_length: int) -> np.ndarray:
     if audio.size < 2 or audio.size == target_length:
         return audio.astype(np.float32, copy=False)
@@ -298,40 +638,71 @@ def verify_file(path: Path, min_size: int, expected_hash: str | None = None) -> 
 
 
 settings = VoiceSettings.from_environment()
+fish_settings = FishAudioSettings.from_environment()
 fx_settings = FxSettings.from_environment()
-voice = PiperVoiceService(settings, JarvisFx(fx_settings))
+fx = JarvisFx(fx_settings)
+piper = PiperVoiceService(settings, fx)
+fish = FishAudioService(fish_settings, fx)
+voice = VoiceRouter(settings, fish, piper, AudioCache(settings.cache_dir, settings.cache_max_chars))
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    await run_in_threadpool(voice.load)
+    await run_in_threadpool(piper.load)
+    # Fill acknowledgement cache without blocking service readiness.
+    threading.Thread(target=voice.prewarm, name="fish-cache-prewarm", daemon=True).start()
     yield
 
 
-app = FastAPI(title="JARVIS Voice Core", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="JARVIS Voice Core", version="0.4.0", lifespan=lifespan)
 
 
 @app.get("/health")
 async def health() -> dict[str, object]:
+    configured_provider = settings.provider
+    preferred_provider = "fish" if configured_provider == "auto" and fish_settings.configured else configured_provider
     return {
-        "status": "ready" if voice.voice is not None else "loading",
-        "engine": "piper", "model": MODEL_ID, "speaker": "mykyta",
-        "sample_rate": settings.sample_rate or voice.native_sample_rate,
-        "speed": settings.speed, "mode": settings.default_mode,
-        "fx_enabled": settings.fx_enabled, "presets": ["raw", "jarvis_reference"],
-        "fx": asdict(fx_settings), "device": "cpu",
+        "status": "ready" if piper.voice is not None else "loading",
+        "engine": preferred_provider,
+        "provider_mode": configured_provider,
+        "active_provider": voice.last_provider,
+        "model": fish.effective_model if preferred_provider == "fish" else MODEL_ID,
+        "reference": masked_reference(fish_settings.reference_id) if preferred_provider == "fish" else "mykyta",
+        "sample_rate": 44_100 if preferred_provider == "fish" else settings.sample_rate or piper.native_sample_rate,
+        "speed": settings.speed,
+        "mode": ("fish_fx" if fish_settings.fx_enabled else "raw") if preferred_provider == "fish" else settings.default_mode,
+        "fx_enabled": fish_settings.fx_enabled if preferred_provider == "fish" else settings.fx_enabled,
+        "presets": ["auto", "fish", "piper"],
+        "fish": {
+            "configured": fish_settings.configured,
+            "unavailable_reason": fish_settings.unavailable_reason,
+            "model": fish.effective_model,
+            "reference": masked_reference(fish_settings.reference_id),
+            "latency": fish_settings.latency,
+            "fx_enabled": fish_settings.fx_enabled,
+        },
+        "piper": {"ready": piper.voice is not None, "model": MODEL_ID, "fx_enabled": settings.fx_enabled},
+        "cache": {"directory": str(settings.cache_dir), "max_phrase_chars": settings.cache_max_chars},
+        "last_fallback_reason": voice.last_error,
+        "device": "cloud" if preferred_provider == "fish" else "cpu",
     }
 
 
 @app.post("/synthesize")
 async def synthesize(request: SynthesisRequest) -> Response:
     try:
-        wav, mode, sample_rate = await run_in_threadpool(voice.synthesize, request)
+        result = await run_in_threadpool(voice.synthesize, request)
     except Exception as error:
         LOGGER.exception("Synthesis failed")
-        raise HTTPException(status_code=500, detail=str(error)) from error
-    return Response(content=wav, media_type="audio/wav", headers={
-        "X-Jarvis-Engine": "piper", "X-Jarvis-Model": MODEL_ID,
-        "X-Jarvis-Speaker": "mykyta", "X-Jarvis-Mode": mode,
-        "X-Jarvis-Sample-Rate": str(sample_rate),
+        raise HTTPException(status_code=500, detail=safe_error(error)) from error
+    return Response(content=result.audio, media_type="audio/wav", headers={
+        "X-Jarvis-Engine": result.provider,
+        "X-Jarvis-Provider": result.provider,
+        "X-Jarvis-Model": result.model,
+        "X-Jarvis-Speaker": result.reference or "default",
+        "X-Jarvis-Reference": result.reference or "default",
+        "X-Jarvis-Mode": result.mode,
+        "X-Jarvis-Sample-Rate": str(result.sample_rate),
+        "X-Jarvis-Cache": "hit" if result.cache_hit else "miss",
+        "X-Jarvis-Fallback-From": result.fallback_from or "none",
     })

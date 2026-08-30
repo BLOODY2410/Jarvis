@@ -1,101 +1,65 @@
 # JARVIS Voice Core
 
-Локальний HTTP sidecar на Piper із українським чоловічим голосом `uk_UA-mykyta-high` та пресетом `jarvis_reference`, налаштованим за наданим відеореференсом. Модель і обробка працюють локально на CPU; сервіс слухає лише `127.0.0.1:8765`.
+Локальний HTTP sidecar на `127.0.0.1:8765`. У режимі `auto` основним TTS є Fish Audio, а локальний український Piper `uk_UA-mykyta-high` автоматично підхоплює запит при 401/403/429/5xx, мережевому timeout або іншій помилці Fish. Старий контракт не змінився: `POST /synthesize` з `{"text":"..."}` повертає WAV, тому Rust Core не потребує окремої інтеграції.
 
-Це стилізація звуку, а не клонування голосу актора. Пресет окремо керує висотою основного тону й формантним забарвленням, а потім додає теплоту, вирізає «коробкові» середні частоти, підкреслює розбірливість, ущільнює динаміку та створює дуже короткий stereo ambience. Українська фонетика лишається за Piper, тому ефекти не замінюють і не перенавчають диктора.
+## Конфігурація
 
-## Встановлення і запуск
+Сервіс сам читає `D:\Jarvis\.env`. Значення ключів не виводяться у логи або `/health`.
+
+```dotenv
+JARVIS_TTS_PROVIDER=auto
+FISH_AUDIO_API_KEY=replace_me
+FISH_AUDIO_REFERENCE_ID=replace_with_voice_model_id
+FISH_AUDIO_MODEL=s2.1-pro-free
+FISH_AUDIO_FALLBACK_MODEL=s2-pro
+FISH_AUDIO_LATENCY=low
+FISH_AUDIO_CONNECT_TIMEOUT_SECS=2.5
+FISH_AUDIO_READ_TIMEOUT_SECS=12
+FISH_AUDIO_RETRIES=1
+FISH_AUDIO_FX_ENABLED=false
+JARVIS_TTS_CACHE_MAX_CHARS=120
+```
+
+`FISH_AUDIO_REFERENCE_ID` — ID голосової моделі Fish Audio. Також підтримується сумісна назва `FISH_AUDIO_VOICE_ID`. Якщо ключа або ID немає, `/health` покаже `missing_api_key` чи `missing_reference_id`, а `auto` без зупинки використовуватиме Piper.
+
+Fish повертає WAV у low-latency режимі, а сервіс читає HTTP-відповідь потоково. WebSocket не використовується навмисно: Rust очікує один завершений WAV, тож WebSocket не скоротив би час до початку відтворення без зміни контракту. Короткі фрази до 120 символів кешуються у `voice_service\cache`; три типові підтвердження прогріваються у фоні після запуску.
+
+Застарілий Piper JARVIS FX за замовчуванням не накладається на Fish (`FISH_AUDIO_FX_ENABLED=false`). Для Piper він лишається доступним через `JARVIS_TTS_MODE=jarvis_reference` та `JARVIS_FX_ENABLED=true`.
+
+## Запуск і перевірка
+
+Одна команда встановлює залежності, запускає тести й сам Jarvis:
+
+```powershell
+cd D:\Jarvis
+.\test-and-start.ps1
+```
+
+Після готовності відкрийте `http://127.0.0.1:8765/health`. Поля `active_provider`, `model`, `reference`, `last_fallback_reason` і `cache` не містять секретів. У відповіді `/synthesize` є безпечні заголовки `X-Jarvis-Provider`, `X-Jarvis-Model`, `X-Jarvis-Cache` і `X-Jarvis-Fallback-From`.
+
+## A/B Fish проти Piper
+
+Коли Voice Core запущений, у другому PowerShell:
 
 ```powershell
 cd D:\Jarvis\voice_service
-.\install.ps1
-.\start.ps1
-```
-
-Під час першого запуску офіційна модель (~114 МБ) і конфіг завантажаться з `rhasspy/piper-voices`. Файл моделі перевіряється за SHA-256.
-
-Rust Desktop Core використовує той самий контракт: `POST /synthesize` з JSON `{"text":"..."}` повертає WAV. Тому `src/voice.rs` змінювати не потрібно.
-
-## A/B-тест raw проти JARVIS FX
-
-Коли sidecar запущений, у другому PowerShell:
-
-```powershell
-cd D:\Jarvis\voice_service
-.\test_service.ps1
-```
-
-Скрипт створить по два файли для чотирьох українських фраз: `test_1_raw.wav` і `test_1_jarvis_reference.wav` тощо. Щоб одразу відтворити кожну пару, додайте `-Play`:
-
-```powershell
 .\test_service.ps1 -Play
 ```
 
-За замовчуванням скрипт звертається до `http://127.0.0.1:8765`; іншу тестову адресу можна передати через `-BaseUrl`.
+Скрипт створить українські пари `test_1_fish.wav` / `test_1_piper.wav` тощо. Якщо Fish недоступний, заголовок покаже фактичний `provider=piper`, тому результат не маскує fallback під Fish.
 
-Для одного запиту режим також можна задати полем `mode`:
-
-```json
-{"text":"Усі системи працюють нормально.","mode":"jarvis_reference"}
-```
-
-Допустимі режими: `raw`, `jarvis_reference` і сумісний зі старою версією псевдонім `jarvis`. Поле `fx_enabled:false` примусово вимикає FX незалежно від режиму. Старий Rust-запит `{"text":"..."}` не змінився; без поля `mode` використовується пресет із `JARVIS_TTS_MODE`.
-
-## Налаштування FX
-
-Змінні задаються перед `.\start.ps1`:
+## Тести
 
 ```powershell
-$env:JARVIS_TTS_MODE = 'jarvis_reference'
-$env:JARVIS_TTS_SPEED = '1.03'
-$env:JARVIS_FX_ENABLED = 'true'
-$env:JARVIS_FX_PITCH_SEMITONES = '-1.10'
-$env:JARVIS_FX_FORMANT_SHIFT_SEMITONES = '-0.70'
-$env:JARVIS_FX_PRESERVE_FORMANTS = 'true'
-$env:JARVIS_FX_LOW_SHELF_DB = '2.4'
-$env:JARVIS_FX_WARMTH_DB = '1.4'
-$env:JARVIS_FX_BOXINESS_DB = '-2.2'
-$env:JARVIS_FX_PRESENCE_DB = '2.3'
-$env:JARVIS_FX_AIR_DB = '0.8'
-$env:JARVIS_FX_COMPRESSOR_THRESHOLD_DB = '-21.0'
-$env:JARVIS_FX_COMPRESSOR_RATIO = '3.0'
-$env:JARVIS_FX_SATURATION_DRIVE_DB = '3.0'
-$env:JARVIS_FX_SATURATION_MIX = '0.08'
-$env:JARVIS_FX_REVERB_ROOM_SIZE = '0.10'
-$env:JARVIS_FX_REVERB_WET_LEVEL = '0.035'
-$env:JARVIS_FX_SPATIAL_DELAY_MS = '7.0'
-$env:JARVIS_FX_SPATIAL_WIDTH = '0.12'
-$env:JARVIS_FX_OUTPUT_GAIN_DB = '-1.2'
-.\start.ps1
+cd D:\Jarvis\voice_service
+..\.venv\Scripts\python.exe -m unittest -v test_app.py
 ```
 
-Для чистого Piper при кожному запиті достатньо `JARVIS_FX_ENABLED=false` або `JARVIS_TTS_MODE=raw`. `JARVIS_TTS_SAMPLE_RATE=native` залишає рідні 22,05 кГц; за потреби можна вказати частоту від 8000 до 48000. Raw WAV залишається mono, а `jarvis_reference` повертає stereo WAV із центральним голосом і короткими ранніми відбиттями; Rust/rodio відтворює обидва формати через той самий HTTP контракт.
-
-## Автоматична перевірка
-
-Швидкі тести не потребують запущеного sidecar або аудіопристрою:
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest -v test_app.py
-```
-
-Наскрізний playback-тест Rust запускається окремо після старту sidecar:
+Наскрізний Rust → localhost TTS → playback після запуску sidecar:
 
 ```powershell
 cd D:\Jarvis
 cargo test voice_service_playback -- --ignored --nocapture
 ```
 
-Для sidecar на іншому порту перед тестом задайте `JARVIS_TTS_TEST_URL`.
-
-## Наскрізний запуск Desktop Core
-
-Після запуску Voice Core відкрийте другий PowerShell:
-
-```powershell
-cd D:\Jarvis
-$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-cargo run
-```
-
-Якщо sidecar недоступний, Desktop Core продовжить працювати текстом і покаже попередження Voice Core. Для повного вимкнення озвучення встановіть `JARVIS_TTS_ENABLED=false` у `.env`.
+Для повністю офлайн-режиму встановіть `JARVIS_TTS_PROVIDER=piper`. Для явного A/B один запит може додати `"provider":"fish"` або `"provider":"piper"`; старий JSON лише з `text` працює без змін.

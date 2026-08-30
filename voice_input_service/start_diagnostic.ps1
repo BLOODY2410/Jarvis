@@ -4,10 +4,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $serviceRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$python = Join-Path $serviceRoot '.venv\Scripts\python.exe'
+$python = Join-Path (Split-Path -Parent $serviceRoot) '.venv\Scripts\python.exe'
 
 if (-not (Test-Path -LiteralPath $python)) {
-    throw 'Venv not found. Run install.ps1 first.'
+    throw 'Shared venv not found. Run D:\Jarvis\install.ps1 first.'
 }
 
 $activeListener = Get-NetTCPConnection -LocalPort 8766 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1

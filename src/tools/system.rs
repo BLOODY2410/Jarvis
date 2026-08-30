@@ -63,6 +63,17 @@ public static class JarvisAudio {
         endpoint.SetMute(muted, Guid.Empty);
         Marshal.ReleaseComObject(endpoint);
     }
+
+    public static float AdjustVolume(float deltaPercent) {
+        var endpoint = Endpoint();
+        float current;
+        endpoint.GetMasterVolumeLevelScalar(out current);
+        float next = Math.Max(0.0f, Math.Min(1.0f, current + deltaPercent / 100.0f));
+        endpoint.SetMasterVolumeLevelScalar(next, Guid.Empty);
+        endpoint.SetMute(false, Guid.Empty);
+        Marshal.ReleaseComObject(endpoint);
+        return next * 100.0f;
+    }
 }
 '@
 "#;
@@ -88,6 +99,15 @@ pub fn set_muted(muted: bool) -> Result<String, String> {
             "Системний звук увімкнено.".to_owned()
         }
     })
+}
+
+pub fn adjust_volume(delta: i8) -> Result<String, String> {
+    let script = format!(
+        "{AUDIO_API}\n$level = [JarvisAudio]::AdjustVolume([single]$env:JARVIS_VOLUME_DELTA)\nWrite-Output ([math]::Round($level))"
+    );
+    let delta = delta.to_string();
+    powershell(&script, &[("JARVIS_VOLUME_DELTA", &delta)])
+        .map(|level| format!("Гучність встановлено приблизно на {}%.", level.trim()))
 }
 
 pub fn get_system_info() -> Result<String, String> {

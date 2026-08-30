@@ -8,6 +8,7 @@ use std::{collections::HashMap, process::Command};
 
 use serde_json::{Value, json};
 
+#[derive(Clone)]
 pub struct ToolRegistry {
     schemas: Vec<Value>,
 }
@@ -146,6 +147,8 @@ impl ToolRegistry {
                 .and_then(|level| system::set_volume(level.min(100) as u8)),
             "mute" => system::set_muted(true),
             "unmute" => system::set_muted(false),
+            "volume_up" => system::adjust_volume(10),
+            "volume_down" => system::adjust_volume(-10),
             "get_system_info" => system::get_system_info(),
             "take_screenshot" => screen::take_screenshot(optional_str(&args, "output_path")),
             "list_files" => required_str(&args, "path").and_then(files::list_files),

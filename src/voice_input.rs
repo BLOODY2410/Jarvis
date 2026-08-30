@@ -14,8 +14,16 @@ pub struct VoiceInputClient {
 pub enum VoiceEvent {
     Wake,
     Interrupt,
-    Transcript { text: String },
-    Error { message: String },
+    Transcript {
+        text: String,
+        #[serde(default)]
+        mic_end_unix_ms: Option<u64>,
+        #[serde(default)]
+        stt_done_unix_ms: Option<u64>,
+    },
+    Error {
+        message: String,
+    },
     Timeout,
     Stopped,
 }

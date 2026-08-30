@@ -1,91 +1,65 @@
 # JARVIS Desktop Core
 
-Rust лишається головним агентом і виконує Windows-інструменти, діалог та керування TTS. Два локальні Python-sidecar ізольовують практичні аудіозалежності:
+Надійний режим для Windows зараз працює так:
 
-- `voice_service` — наявний TTS-контракт `POST /synthesize` на `127.0.0.1:8765` (не змінений);
-- `voice_input_service` — мікрофон, VAD, wake word, Groq Whisper та керований barge-in на `127.0.0.1:8766`.
+- `Ctrl+Alt+J` або `POST /activate` активує слухання;
+- системний мікрофон вибирається автоматично, а Stereo Mix/loopback відсіюються;
+- 560 мс pre-roll зберігає початок фрази;
+- короткий запис завершується після 560 мс тиші, а після 3 с мовлення timeout адаптивно зростає до 1,2 с;
+- коротке аудіо йде у Groq `whisper-large-v3-turbo`, довге або невдала turbo-спроба — у `whisper-large-v3`;
+- Rust спочатку перевіряє локальний Fast Command Engine і лише за невпевненості викликає Groq LLM;
+- проста дія стартує одразу після intent match, а коротке TTS-підтвердження не генерується LLM;
+- Fish Audio озвучує відповіді першим у режимі `auto`, короткі підтвердження кешуються, а локальний Piper автоматично працює при помилці API або мережі;
+- мікрофон закритий під час обробки команди, TTS і короткого post-TTS guard.
 
-У фоні Whisper не працює. До активації обчислюється лише локальний wake detector/VAD. Після відповіді розмовний режим лишається активним 25 секунд, тому «Джарвіс» не треба повторювати перед наступною реплікою.
+Wake word винесено з критичного шляху. `openWakeWord hey_jarvis` навчений переважно під англійську вимову, а маленький Vosk не дає стабільних 9/10 для українського «Джарвіс» на цьому мікрофоні. Тому робочий стандарт — глобальна клавіша `Ctrl+Alt+J`. Експериментальний режим лишився окремо: `JARVIS_ACTIVATION_MODE=wake`.
 
-## Повний запуск
+## Один запуск
 
-Переконайтеся, що в `D:\Jarvis\.env` є `GROQ_API_KEY`. Одноразово встановіть Voice Input Core:
+У `D:\Jarvis\.env` мають бути дійсні `GROQ_API_KEY`, `FISH_AUDIO_API_KEY` і `FISH_AUDIO_REFERENCE_ID`. Fish-секрети сервіс читає безпосередньо з `.env` і не показує у статусі чи логах. Перший раз:
 
 ```powershell
-cd D:\Jarvis\voice_input_service
+cd D:\Jarvis
 .\install.ps1
 ```
 
-Запустіть три PowerShell-вікна:
-
-```powershell
-cd D:\Jarvis\voice_service
-.\start.ps1
-```
-
-```powershell
-cd D:\Jarvis\voice_input_service
-.\start.ps1
-```
+Надалі потрібна одна команда:
 
 ```powershell
 cd D:\Jarvis
-$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-cargo run
-```
-
-Якщо Voice Input Core недоступний або в `.env` задано `JARVIS_VOICE_INPUT_ENABLED=false`, Rust автоматично відкриває старий текстовий цикл. Недоступний TTS не зупиняє діалог і лише дає попередження.
-
-## Перевірка сценарію
-
-1. Скажіть: «Джарвіс» (або «Хей, Джарвіс»), потім: «Відкрий YouTube».
-2. Дочекайтеся виконання та початку голосової відповіді.
-3. Якщо використовуються навушники й задано `JARVIS_BARGE_IN_ENABLED=true`, під час відповіді скажіть: «Ні, відкрий у новій вкладці» — аудіо має зупинитися, а нова команда виконатися. З колонками barge-in лишається вимкненим, щоб Jarvis не чув сам себе.
-4. Упродовж 25 секунд поставте ще одне питання без слова «Джарвіс».
-5. Перевірте аварійну зупинку через `Ctrl+C` або `voice_input_service\stop.ps1`.
-
-## Автоматичні перевірки
-
-```powershell
-cd D:\Jarvis
-$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-cargo test
-```
-
-```powershell
-cd D:\Jarvis\voice_input_service
-.\.venv\Scripts\python.exe -m unittest -v test_app.py
-```
-
-Screen Vision і керування мишкою до цього етапу не входять.
-
-## Діагностика Voice Input Core
-
-Для окремої перевірки мікрофона, VAD, WAV до/після обрізання, Whisper metadata та wake score:
-
-```powershell
-cd D:\Jarvis\voice_input_service
-.\list_microphones.ps1
-.\start_diagnostic.ps1
-```
-
-Повний сценарій стабілізації та пояснення логів є у `voice_input_service\README.md`.
-
-## Перезапуск після зміни voice-конфігів
-
-У вікні Voice Input Core натисніть `Ctrl+C`, потім запустіть його знову:
-
-```powershell
-cd D:\Jarvis\voice_input_service
 .\start.ps1
 ```
 
-У вікні Rust Core натисніть `Ctrl+C`, потім:
+Скрипт використовує єдине середовище `D:\Jarvis\.venv`, запускає обидва аудіосервіси, перевіряє їхній `/health`, а потім запускає Rust Core. `Ctrl+C` завершує Core і локальні сервіси, які запустив цей скрипт.
+
+Для одного сценарію «тести + запуск» використовуйте:
 
 ```powershell
 cd D:\Jarvis
-$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-cargo run
+.\test-and-start.ps1
 ```
 
-TTS-sidecar перезапускати не потрібно: його HTTP-контракт і конфіг цими змінами не зачіпаються.
+Безпечний статус TTS доступний на `http://127.0.0.1:8765/health`; `engine`, `active_provider`, `model`, `reference`, `cache` та причина останнього fallback не містять API-ключа.
+
+## Тест 1-2-3
+
+1. Натисніть `Ctrl+Alt+J` і дочекайтеся «До ваших послуг, пане».
+2. Скажіть одним реченням: «Відкрий YouTube» — не починайте говорити поверх привітання.
+3. Переконайтеся, що команда з'явилася після `Ви:`, виконалась, а Jarvis відповів голосом. Повторіть 10 разів; ціль — щонайменше 9 правильних transcript.
+
+Останні реальні записи завжди зберігаються у `voice_input_service\diagnostics\last_raw.wav` і `last_whisper.wav`. Вибраний пристрій та рівні видно на `http://127.0.0.1:8766/diagnostics`. Щоб зафіксувати мікрофон, задайте у `.env` індекс або унікальну частину назви: `JARVIS_MIC_DEVICE=1`.
+
+Vision і Memory до цього етапу не додавалися.
+
+## Fast Command Engine
+
+Без LLM локально виконуються: відкриття/закриття програм, відомі сайти й домени, абсолютна та відносна гучність, mute/unmute, список запущених програм і знімок екрана. Приклади: «Відкрий калькулятор», «Відкрий YouTube», «Гучність 40», «Зроби тихіше», «Вимкни звук», «Закрий блокнот».
+
+Складені або неоднозначні фрази не вгадуються: вони автоматично переходять у наявний Groq LLM tool-calling. У консолі Fast Path позначено `[Fast Path]`, а один рядок `[Latency]` показує `mic_end→stt_done`, `stt_done→intent`, `intent→tool_start`, `tool_start→tool_done`, `tool_done→tts_start` і `total` у мілісекундах. `mic_end` — останній голосовий фрейм, тому `total` включає adaptive VAD timeout.
+
+Для автоматичної перевірки п'яти еталонних команд і подальшого запуску:
+
+```powershell
+cd D:\Jarvis
+.\test-and-start.ps1
+```
