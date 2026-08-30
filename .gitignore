@@ -1,0 +1,14 @@
+/target
+.env
+screenshots/
+voice_service/.venv/
+voice_input_service/.venv/
+voice_input_service/models/
+voice_input_service/diagnostics/
+voice_service/__pycache__/
+voice_service/*.wav
+voice_service/models/*.pt
+voice_service/models/*.onnx
+voice_service/models/*.json
+voice_service/models/*.download
+.pytest_cache/

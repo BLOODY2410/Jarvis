@@ -1,0 +1,5 @@
+fastapi==0.141.1
+uvicorn==0.52.4
+piper-tts==1.7.0
+pedalboard==0.9.24
+numpy==2.4.3
