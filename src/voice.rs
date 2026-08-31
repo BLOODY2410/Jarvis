@@ -51,7 +51,7 @@ impl VoiceClient {
             .await
     }
 
-    pub async fn speak_ack(&self, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn speak_ack(&self, name: &str) -> Result<bool, Box<dyn Error + Send + Sync>> {
         let response = self
             .http
             .get(format!("{}/ack/{name}", self.base_url))
@@ -59,11 +59,7 @@ impl VoiceClient {
             .send()
             .await?;
         if response.status() == reqwest::StatusCode::NO_CONTENT {
-            return tokio::task::spawn_blocking(play_activation_cue)
-                .await
-                .map_err(|error| -> Box<dyn Error + Send + Sync> {
-                    format!("ack cue worker failed: {error}").into()
-                })?;
+            return Ok(false);
         }
         let response = response.error_for_status()?;
         let wav = response.bytes().await?.to_vec();
@@ -72,7 +68,7 @@ impl VoiceClient {
             .map_err(|error| -> Box<dyn Error + Send + Sync> {
                 format!("ack playback worker failed: {error}").into()
             })??;
-        Ok(())
+        Ok(true)
     }
 
     pub async fn speak_cancellable(

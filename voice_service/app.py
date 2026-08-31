@@ -34,6 +34,14 @@ MODEL_SHA256 = "081d253cd246d7d4d698c6dd147b74cad498dafd213527887a3a490519138243
 MODEL_BASE_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/uk/uk_UA/mykyta/high"
 VoiceMode: TypeAlias = Literal["raw", "jarvis", "jarvis_reference"]
 ProviderMode: TypeAlias = Literal["auto", "fish", "piper"]
+ACKNOWLEDGEMENTS = {
+    "done": "Готово.",
+    "opened": "Відкрито.",
+    "closed": "Програму закрито.",
+    "louder": "Гучність збільшено.",
+    "quieter": "Гучність зменшено.",
+    "muted": "Звук вимкнено.",
+}
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -98,6 +106,7 @@ class FishAudioSettings:
     read_timeout: float
     retries: int
     retry_delay: float
+    speed: float
     fx_enabled: bool
     allow_paid_fallback: bool = False
 
@@ -106,6 +115,9 @@ class FishAudioSettings:
         latency = os.getenv("FISH_AUDIO_LATENCY", "low").strip().lower()
         if latency not in {"low", "balanced", "normal"}:
             raise ValueError("FISH_AUDIO_LATENCY must be low, balanced, or normal")
+        speed = float(os.getenv("FISH_AUDIO_SPEED", "0.97"))
+        if not 0.90 <= speed <= 1.10:
+            raise ValueError("FISH_AUDIO_SPEED must be between 0.90 and 1.10")
         return cls(
             api_key=os.getenv("FISH_AUDIO_API_KEY", "").strip(),
             reference_id=(os.getenv("FISH_AUDIO_REFERENCE_ID") or os.getenv("FISH_AUDIO_VOICE_ID") or "").strip(),
@@ -117,6 +129,7 @@ class FishAudioSettings:
             read_timeout=float(os.getenv("FISH_AUDIO_READ_TIMEOUT_SECS", "12")),
             retries=max(0, int(os.getenv("FISH_AUDIO_RETRIES", "1"))),
             retry_delay=max(0.0, float(os.getenv("FISH_AUDIO_RETRY_DELAY_SECS", "0.25"))),
+            speed=speed,
             fx_enabled=env_bool("FISH_AUDIO_FX_ENABLED", False),
             allow_paid_fallback=env_bool("FISH_AUDIO_ALLOW_PAID_FALLBACK", False),
         )
@@ -360,17 +373,7 @@ class FishAudioService:
         )
 
     def _request_audio(self, request: SynthesisRequest, model: str) -> bytes:
-        payload: dict[str, object] = {
-            "text": request.text.strip(),
-            "reference_id": self.settings.reference_id,
-            "format": "wav",
-            "latency": self.settings.latency,
-            "prosody": {"speed": request.speed or 1.0, "volume": 0, "normalize_loudness": True},
-        }
-        # Fish accepts only a fixed set of WAV sample rates. Omit unsupported
-        # values and let the API use its documented 44.1 kHz default.
-        if request.sample_rate in {8_000, 16_000, 24_000, 32_000, 44_100}:
-            payload["sample_rate"] = request.sample_rate
+        payload = self._payload(request, streaming=False)
         headers = {
             "Authorization": f"Bearer {self.settings.api_key}",
             "Content-Type": "application/json",
@@ -444,14 +447,7 @@ class FishAudioService:
         raise FishAudioError(f"Fish Audio returned HTTP {status}", status)
 
     def _open_response(self, request: SynthesisRequest, model: str) -> requests.Response:
-        payload: dict[str, object] = {
-            "text": request.text.strip(),
-            "reference_id": self.settings.reference_id,
-            "format": "wav",
-            "latency": self.settings.latency,
-            "sample_rate": request.sample_rate or 44_100,
-            "prosody": {"speed": request.speed or 1.0, "volume": 0, "normalize_loudness": True},
-        }
+        payload = self._payload(request, streaming=True)
         return self._session.post(
             self.settings.endpoint,
             headers={
@@ -465,6 +461,26 @@ class FishAudioService:
             timeout=(self.settings.connect_timeout, self.settings.read_timeout),
         )
 
+    def _payload(self, request: SynthesisRequest, streaming: bool) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "text": request.text.strip(),
+            "reference_id": self.settings.reference_id,
+            "format": "wav",
+            "latency": self.settings.latency,
+            "prosody": {
+                "speed": request.speed if request.speed is not None else self.settings.speed,
+                "volume": 0,
+                "normalize_loudness": True,
+            },
+        }
+        if streaming:
+            payload["sample_rate"] = request.sample_rate or 44_100
+        elif request.sample_rate in {8_000, 16_000, 24_000, 32_000, 44_100}:
+            # Fish accepts only a fixed set of WAV sample rates. Omit unsupported
+            # values and let the API use its documented 44.1 kHz default.
+            payload["sample_rate"] = request.sample_rate
+        return payload
+
 
 class AudioCache:
     def __init__(self, root: Path, max_chars: int) -> None:
@@ -472,13 +488,21 @@ class AudioCache:
         self.max_chars = max_chars
         self.root.mkdir(parents=True, exist_ok=True)
 
-    def key(self, provider: str, model: str, reference: str, request: SynthesisRequest) -> str | None:
+    def key(
+        self,
+        provider: str,
+        model: str,
+        reference: str,
+        request: SynthesisRequest,
+        default_speed: float | None = None,
+    ) -> str | None:
         text = " ".join(request.text.split())
         if not text or len(text) > self.max_chars:
             return None
         material = "\n".join([
-            "v2", provider, model, reference, text,
-            str(request.speed or "default"), str(request.sample_rate or "native"),
+            "cinematic-v3", provider, model, reference, text,
+            str(request.speed if request.speed is not None else default_speed or "default"),
+            str(request.sample_rate or "native"),
         ])
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
@@ -524,7 +548,13 @@ class VoiceRouter:
         if use_fish:
             model = self.fish.effective_model
             fish_cache_provider = "fish_fx" if self.fish.settings.fx_enabled else "fish"
-            cache_key = self.cache.key(fish_cache_provider, model, self.fish.settings.reference_id, request)
+            cache_key = self.cache.key(
+                fish_cache_provider,
+                model,
+                self.fish.settings.reference_id,
+                request,
+                self.fish.settings.speed,
+            )
             cached = self.cache.read(cache_key)
             if cached is not None:
                 result = SynthesisResult(
@@ -537,7 +567,13 @@ class VoiceRouter:
             try:
                 result = self.fish.synthesize(request)
                 # The negotiated model can differ when the free model has expired.
-                final_key = self.cache.key(fish_cache_provider, result.model, self.fish.settings.reference_id, request)
+                final_key = self.cache.key(
+                    fish_cache_provider,
+                    result.model,
+                    self.fish.settings.reference_id,
+                    request,
+                    self.fish.settings.speed,
+                )
                 self.cache.write(final_key, result.audio)
                 self._remember(result.provider, None)
                 return result
@@ -567,13 +603,7 @@ class VoiceRouter:
     def prewarm(self) -> None:
         if self.settings.provider not in {"auto", "fish"} or not self.fish.settings.configured:
             return
-        phrases = [
-            "Так, пане.",
-            "Виконую.",
-            "Готово.",
-            "Не вдалося виконати.",
-        ]
-        for text in phrases:
+        for text in ACKNOWLEDGEMENTS.values():
             try:
                 self.synthesize(SynthesisRequest(text=text, provider="fish"))
             except Exception as error:
@@ -750,7 +780,7 @@ async def health() -> dict[str, object]:
         "model": fish.effective_model if preferred_provider == "fish" else MODEL_ID,
         "reference": masked_reference(fish_settings.reference_id) if preferred_provider == "fish" else "mykyta",
         "sample_rate": 44_100 if preferred_provider == "fish" else settings.sample_rate or piper.native_sample_rate,
-        "speed": settings.speed,
+        "speed": fish_settings.speed if preferred_provider == "fish" else settings.speed,
         "mode": ("fish_fx" if fish_settings.fx_enabled else "raw") if preferred_provider == "fish" else settings.default_mode,
         "fx_enabled": fish_settings.fx_enabled if preferred_provider == "fish" else settings.fx_enabled,
         "presets": ["auto", "fish", "piper"],
@@ -760,6 +790,7 @@ async def health() -> dict[str, object]:
             "model": fish.effective_model,
             "reference": masked_reference(fish_settings.reference_id),
             "latency": fish_settings.latency,
+            "speed": fish_settings.speed,
             "fx_enabled": fish_settings.fx_enabled,
             "paid_fallback_allowed": fish_settings.allow_paid_fallback,
         },
@@ -790,14 +821,6 @@ async def synthesize(request: SynthesisRequest) -> Response:
     })
 
 
-ACKNOWLEDGEMENTS = {
-    "yes": "Так, пане.",
-    "working": "Виконую.",
-    "done": "Готово.",
-    "failed": "Не вдалося виконати.",
-}
-
-
 @app.get("/ack/{name}")
 async def acknowledgement(name: str) -> Response:
     """Return only pre-generated Fish audio; never make a live cloud call."""
@@ -806,7 +829,13 @@ async def acknowledgement(name: str) -> Response:
         raise HTTPException(status_code=404, detail="unknown_acknowledgement")
     request = SynthesisRequest(text=text, provider="fish")
     provider = "fish_fx" if fish.settings.fx_enabled else "fish"
-    key = voice.cache.key(provider, fish.effective_model, fish.settings.reference_id, request)
+    key = voice.cache.key(
+        provider,
+        fish.effective_model,
+        fish.settings.reference_id,
+        request,
+        fish.settings.speed,
+    )
     audio = voice.cache.read(key)
     if audio is None:
         return Response(status_code=204, headers={"X-Jarvis-Cache": "miss"})

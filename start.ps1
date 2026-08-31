@@ -110,7 +110,7 @@ try {
     Start-LocalService 'voice-service' (Join-Path $projectRoot 'voice_service') 8765
     Test-TtsSynthesis
     Start-LocalService 'voice-input' (Join-Path $projectRoot 'voice_input_service') 8766
-    Write-Host 'JARVIS ready. Press Ctrl+Alt+J, wait for the short cue, then speak.'
+    Write-Host 'JARVIS ready. Say "Джарвіс" or press Ctrl+Alt+J, wait for the short cue, then speak.'
     Set-Location -LiteralPath $projectRoot
     & $cargo run
 } finally {

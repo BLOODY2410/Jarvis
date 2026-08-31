@@ -61,6 +61,7 @@ class VoiceInputTests(unittest.TestCase):
         self.assertEqual(settings.stt_response_format, "json")
         self.assertFalse(settings.barge_in_enabled)
         self.assertEqual(settings.wake_vosk_max_edit_distance, 1)
+        self.assertEqual(settings.activation_mode, "hybrid")
 
     def test_deactivation_drops_stale_events(self):
         engine = VoiceInputEngine(test_settings())
@@ -89,8 +90,8 @@ class VoiceInputTests(unittest.TestCase):
             self.assertEqual(read_pcm_wav(Path(directory) / "last_raw.wav"), raw_pcm)
             self.assertEqual(read_pcm_wav(Path(directory) / "last_whisper.wav"), whisper_pcm)
 
-    def test_wake_event_switches_to_active_mode(self):
-        engine = VoiceInputEngine(replace(test_settings(), activation_mode="wake"))
+    def test_hybrid_wake_event_switches_to_active_mode(self):
+        engine = VoiceInputEngine(replace(test_settings(), activation_mode="hybrid"))
         engine._wake_model = Mock()
         engine._wake_model.models = {"hey_jarvis": object()}
         engine._wake_model.predict.return_value = {"hey_jarvis": 0.9}
@@ -98,6 +99,24 @@ class VoiceInputTests(unittest.TestCase):
             engine.process_frame(np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes())
         self.assertEqual(engine.events.get_nowait(), {"type": "wake"})
         self.assertTrue(engine.get_state()["conversation_active"])
+
+    def test_hybrid_hotkey_fallback_activates_listening(self):
+        engine = VoiceInputEngine(replace(test_settings(), activation_mode="hybrid"))
+        engine.force_activate()
+        self.assertEqual(engine.events.get_nowait(), {"type": "wake"})
+        self.assertTrue(engine.get_state()["conversation_active"])
+
+    def test_hybrid_wake_backend_failure_does_not_break_hotkey_fallback(self):
+        engine = VoiceInputEngine(replace(test_settings(), activation_mode="hybrid"))
+        with patch.object(engine, "_load_wake_model", side_effect=RuntimeError("offline")), \
+             patch.object(engine, "_load_ukrainian_wake_model", side_effect=RuntimeError("offline")):
+            engine._load_wake_backends()
+        self.assertEqual(
+            engine.get_state()["wake_backends"]["errors"],
+            ("openwakeword:RuntimeError", "vosk_uk:RuntimeError"),
+        )
+        engine.force_activate()
+        self.assertEqual(engine.events.get_nowait(), {"type": "wake"})
 
     def test_wake_wav_reports_measured_score(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -143,6 +162,21 @@ class VoiceInputTests(unittest.TestCase):
                     break
                 __import__("time").sleep(0.01)
             self.assertTrue(transcribe.called)
+
+    def test_speech_start_emits_state_event_before_transcription(self):
+        engine = VoiceInputEngine(test_settings())
+        engine.set_state(True, False)
+        speech = np.full(FRAME_SAMPLES, 12000, dtype=np.int16).tobytes()
+        with patch.object(engine, "_is_speech", return_value=True):
+            engine.process_frame(speech)
+        self.assertEqual(engine.events.get_nowait(), {"type": "speech_started"})
+
+    def test_filtered_capture_returns_rust_to_listening(self):
+        engine = VoiceInputEngine(test_settings())
+        engine.set_state(True, False)
+        quiet = np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes()
+        engine._transcribe([quiet], [quiet], FRAME_MS)
+        self.assertEqual(engine.events.get_nowait(), {"type": "listening"})
 
     def test_vad_keeps_pre_roll_and_only_configured_post_roll(self):
         settings = replace(test_settings(), pre_roll_ms=40, post_roll_ms=20, silence_ms=40, fast_silence_ms=40)

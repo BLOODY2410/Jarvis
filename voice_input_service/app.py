@@ -94,7 +94,7 @@ class Settings:
     vad_energy_ratio: float = 1.10
     vad_energy_delta: float = 0.004
     vad_start_chunks: int = 1
-    activation_mode: str = "hotkey"
+    activation_mode: str = "hybrid"
     hotkey_enabled: bool = True
     fast_whisper_model: str = "whisper-large-v3-turbo"
     fast_silence_ms: int = 440
@@ -149,7 +149,7 @@ class Settings:
             vad_energy_ratio=max(1.0, env_float("JARVIS_VAD_ENERGY_RATIO", 1.10)),
             vad_energy_delta=max(0.0, env_float("JARVIS_VAD_ENERGY_DELTA", 0.004)),
             vad_start_chunks=max(1, int(env_float("JARVIS_VAD_START_CHUNKS", 2))),
-            activation_mode=os.getenv("JARVIS_ACTIVATION_MODE", "hotkey").strip().lower(),
+            activation_mode=os.getenv("JARVIS_ACTIVATION_MODE", "hybrid").strip().lower(),
             hotkey_enabled=env_bool("JARVIS_HOTKEY_ENABLED", True),
             fast_whisper_model=os.getenv(
                 "JARVIS_FAST_WHISPER_MODEL", "whisper-large-v3-turbo"
@@ -218,6 +218,8 @@ class VoiceInputEngine:
         self._vad_resume_run = 0
         self._device: int | str | None = settings.device
         self._hotkey_thread: threading.Thread | None = None
+        self._wake_loader_thread: threading.Thread | None = None
+        self._wake_backend_errors: list[str] = []
         self._last_mic_end_unix_ms: int | None = None
         self._wake_frames: deque[bytes] = deque(maxlen=WAKE_FRAME_COUNT)
         self._session = requests.Session()
@@ -225,11 +227,8 @@ class VoiceInputEngine:
     def start(self) -> None:
         if not self.settings.groq_api_key:
             raise RuntimeError("GROQ_API_KEY is required for Groq Whisper STT")
-        if self.settings.activation_mode == "wake":
-            self._load_wake_model()
-            self._load_ukrainian_wake_model()
-        elif self.settings.activation_mode not in {"hotkey", "api"}:
-            raise RuntimeError("JARVIS_ACTIVATION_MODE must be hotkey, api, or wake")
+        if self.settings.activation_mode not in {"hotkey", "api", "wake", "hybrid"}:
+            raise RuntimeError("JARVIS_ACTIVATION_MODE must be hotkey, api, wake, or hybrid")
         self._log_audio_devices()
         if self.settings.diagnostic:
             self.settings.diagnostic_dir.mkdir(parents=True, exist_ok=True)
@@ -264,11 +263,18 @@ class VoiceInputEngine:
         )
         self._thread = threading.Thread(target=self._audio_loop, name="jarvis-microphone", daemon=True)
         self._thread.start()
-        if self.settings.activation_mode == "hotkey" and self.settings.hotkey_enabled:
+        if self.settings.activation_mode in {"hotkey", "hybrid"} and self.settings.hotkey_enabled:
             self._hotkey_thread = threading.Thread(
                 target=self._hotkey_loop, name="jarvis-hotkey", daemon=True
             )
             self._hotkey_thread.start()
+        if self.settings.activation_mode in {"wake", "hybrid"}:
+            self._wake_loader_thread = threading.Thread(
+                target=self._load_wake_backends,
+                name="jarvis-wake-loader",
+                daemon=True,
+            )
+            self._wake_loader_thread.start()
 
     def stop(self) -> None:
         self._stop.set()
@@ -323,6 +329,11 @@ class VoiceInputEngine:
                 "energy_gate_rms": round(self._energy_threshold(), 6),
                 "last_transcript": self._last_transcript,
                 "recent_level_window": level_window,
+                "wake_backends": {
+                    "openwakeword": self._wake_model is not None,
+                    "vosk_uk": self._vosk_recognizer is not None,
+                    "errors": tuple(self._wake_backend_errors),
+                },
             }
 
     @staticmethod
@@ -489,6 +500,27 @@ class VoiceInputEngine:
         self._wake_model_name = next(iter(self._wake_model.models))
         LOGGER.info("Wake detector loaded: %s", self._wake_model_name)
 
+    def _load_wake_backends(self) -> None:
+        errors: list[str] = []
+        for name, loader in (
+            ("openwakeword", self._load_wake_model),
+            ("vosk_uk", self._load_ukrainian_wake_model),
+        ):
+            try:
+                loader()
+            except Exception as error:
+                safe_name = f"{name}:{type(error).__name__}"
+                errors.append(safe_name)
+                if self.settings.diagnostic:
+                    LOGGER.exception("Wake backend failed: %s", name)
+                else:
+                    LOGGER.warning("Wake backend unavailable: %s (%s)", name, type(error).__name__)
+        with self._lock:
+            self._wake_backend_errors = errors
+        if self._wake_model is None and self._vosk_recognizer is None:
+            fallback = "Ctrl+Alt+J remains active" if self.settings.activation_mode == "hybrid" else "POST /activate remains available"
+            LOGGER.warning("Wake phrase unavailable; %s", fallback)
+
     def _load_ukrainian_wake_model(self) -> None:
         from vosk import KaldiRecognizer, Model, SetLogLevel
 
@@ -558,28 +590,43 @@ class VoiceInputEngine:
         if not active:
             self._noise_history.append(rms)
             self._pre_roll.append(frame)
-            if self.settings.activation_mode != "wake":
+            if self.settings.activation_mode not in {"wake", "hybrid"}:
                 self._log_levels_if_due(rms, peak, False)
                 return
-            self._wake_frames.append(frame)
             ukrainian_text = self._ukrainian_wake_text(frame)
-            if len(self._wake_frames) < WAKE_FRAME_COUNT:
-                self._log_levels_if_due(rms, peak, False, 0.0, ukrainian_text)
-                return
-            wake_frame = b"".join(self._wake_frames)
-            self._wake_frames.clear()
-            samples = np.frombuffer(wake_frame, dtype=np.int16)
-            with self._wake_lock:
-                predictions = self._wake_model.predict(samples)
-                score = float(predictions.get(self._wake_model_name, 0.0))
-            self._last_wake_score = score
-            self._log_levels_if_due(rms, peak, False, score, ukrainian_text)
-            if score >= self.settings.wake_threshold or contains_wake_word(
+            vosk_detected = contains_wake_word(
                 ukrainian_text,
                 self.settings.wake_variants,
                 self.settings.wake_vosk_max_edit_distance,
-            ):
-                source = f"openWakeWord score {score:.3f}" if score >= self.settings.wake_threshold else f"Vosk: {ukrainian_text}"
+            )
+            score: float | None = None
+            if self._wake_model is not None:
+                self._wake_frames.append(frame)
+                if len(self._wake_frames) >= WAKE_FRAME_COUNT:
+                    wake_frame = b"".join(self._wake_frames)
+                    self._wake_frames.clear()
+                    samples = np.frombuffer(wake_frame, dtype=np.int16)
+                    try:
+                        with self._wake_lock:
+                            predictions = self._wake_model.predict(samples)
+                            score = float(predictions.get(self._wake_model_name, 0.0))
+                    except Exception as error:
+                        with self._wake_lock:
+                            self._wake_model = None
+                        with self._lock:
+                            self._wake_backend_errors.append(f"openwakeword_runtime:{type(error).__name__}")
+                        LOGGER.warning("openWakeWord disabled after runtime failure (%s)", type(error).__name__)
+            else:
+                self._wake_frames.clear()
+            if score is not None:
+                self._last_wake_score = score
+            self._log_levels_if_due(rms, peak, False, score, ukrainian_text)
+            if (score is not None and score >= self.settings.wake_threshold) or vosk_detected:
+                source = (
+                    f"openWakeWord score {score:.3f}"
+                    if score is not None and score >= self.settings.wake_threshold
+                    else f"Vosk: {ukrainian_text}"
+                )
                 LOGGER.info("Wake word detected (%s)", source)
                 with self._lock:
                     self._conversation_active = True
@@ -660,6 +707,8 @@ class VoiceInputEngine:
                 self._capture = list(self._pre_roll)
                 self._pre_roll.clear()
                 self._capture_started_at = time.monotonic()
+                if not speaking:
+                    self._emit({"type": "speech_started"})
                 LOGGER.info(
                     "VAD recording START: pre_roll=%d ms rms=%.4f (%.1f dBFS) peak=%.4f (%.1f dBFS) noise=%.4f gate=%.4f",
                     len(self._capture) * FRAME_MS,
@@ -770,11 +819,18 @@ class VoiceInputEngine:
     def _ukrainian_wake_text(self, frame: bytes) -> str:
         if self._vosk_recognizer is None:
             return ""
-        if self._vosk_recognizer.AcceptWaveform(frame):
-            payload = json.loads(self._vosk_recognizer.Result())
-            return str(payload.get("text", ""))
-        payload = json.loads(self._vosk_recognizer.PartialResult())
-        return str(payload.get("partial", ""))
+        try:
+            if self._vosk_recognizer.AcceptWaveform(frame):
+                payload = json.loads(self._vosk_recognizer.Result())
+                return str(payload.get("text", ""))
+            payload = json.loads(self._vosk_recognizer.PartialResult())
+            return str(payload.get("partial", ""))
+        except Exception as error:
+            self._vosk_recognizer = None
+            with self._lock:
+                self._wake_backend_errors.append(f"vosk_runtime:{type(error).__name__}")
+            LOGGER.warning("Ukrainian wake matcher disabled after runtime failure (%s)", type(error).__name__)
+            return ""
 
     def _reset_capture(self) -> None:
         self._capture = []
@@ -788,6 +844,7 @@ class VoiceInputEngine:
         self._vad_resume_run = 0
 
     def _transcribe(self, raw_frames: list[bytes], whisper_frames: list[bytes], speech_ms: int) -> None:
+        terminal_event_emitted = False
         try:
             raw_pcm = b"".join(raw_frames)
             pcm = b"".join(whisper_frames)
@@ -885,13 +942,18 @@ class VoiceInputEngine:
                     "stt_first_byte_unix_ms": stt_first_byte_unix_ms,
                     "stt_done_unix_ms": stt_done_unix_ms,
                 })
+                terminal_event_emitted = True
         except Exception as error:
             LOGGER.exception("Groq Whisper request failed")
             self._emit({"type": "error", "message": f"Groq Whisper не відповів: {error}"})
+            terminal_event_emitted = True
         finally:
             with self._lock:
                 self._stt_busy = False
                 self._transition("LISTENING" if self._conversation_active else "IDLE", "stt_complete")
+                conversation_active = self._conversation_active
+            if conversation_active and not terminal_event_emitted:
+                self._emit({"type": "listening"})
             LOGGER.info("Capture resumed after Whisper request")
 
     def _transition(self, new_state: str, reason: str) -> None:
@@ -1128,7 +1190,7 @@ def diagnostics() -> dict[str, object]:
         "wake_vosk_max_edit_distance": settings.wake_vosk_max_edit_distance,
         "barge_in_enabled": settings.barge_in_enabled,
         "activation_mode": settings.activation_mode,
-        "hotkey": "Ctrl+Alt+J" if settings.activation_mode == "hotkey" else None,
+        "hotkey": "Ctrl+Alt+J" if settings.activation_mode in {"hotkey", "hybrid"} else None,
         "last_raw_wav": str(settings.diagnostic_dir / "last_raw.wav"),
         "last_whisper_wav": str(settings.diagnostic_dir / "last_whisper.wav"),
     }

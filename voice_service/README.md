@@ -13,6 +13,7 @@ FISH_AUDIO_REFERENCE_ID=replace_with_voice_model_id
 FISH_AUDIO_MODEL=s2.1-pro-free
 FISH_AUDIO_FALLBACK_MODEL=s2-pro
 FISH_AUDIO_LATENCY=low
+FISH_AUDIO_SPEED=0.97
 FISH_AUDIO_CONNECT_TIMEOUT_SECS=2.5
 FISH_AUDIO_READ_TIMEOUT_SECS=12
 FISH_AUDIO_RETRIES=1
@@ -23,7 +24,7 @@ JARVIS_TTS_CACHE_MAX_CHARS=120
 
 `FISH_AUDIO_REFERENCE_ID` — ID голосової моделі Fish Audio. Також підтримується сумісна назва `FISH_AUDIO_VOICE_ID`. Якщо ключа або ID немає, `/health` покаже `missing_api_key` чи `missing_reference_id`, а `auto` без зупинки використовуватиме Piper.
 
-`POST /synthesize/stream` віддає PCM chunks одразу після Fish, і Rust починає playback після мінімального буфера; сумісний `POST /synthesize` як і раніше повертає завершений WAV. Чотири типові підтвердження прогріваються у фоні, а `GET /ack/{name}` ніколи не робить live cloud call. Piper завантажується у фоні й безпечно очікується лише при fallback.
+`POST /synthesize/stream` віддає PCM chunks одразу після Fish, і Rust починає playback після мінімального буфера; сумісний `POST /synthesize` як і раніше повертає завершений WAV. `FISH_AUDIO_SPEED` окремо керує Fish streaming і WAV payload; допустимий діапазон 0.90–1.10, cinematic default — 0.97. Шість коротких outcome-підтверджень прогріваються у фоні, а `GET /ack/{name}` ніколи не робить live cloud call. Версія cache key не допускає відтворення старих фраз. Piper завантажується у фоні й безпечно очікується лише при fallback.
 
 Перехід із `s2.1-pro-free` на платну модель заборонений за замовчуванням. Він можливий лише після явного `FISH_AUDIO_ALLOW_PAID_FALLBACK=true`; інакше будь-яке відхилення free-моделі переходить у Piper.
 

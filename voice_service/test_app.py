@@ -12,6 +12,7 @@ from unittest.mock import patch
 import numpy as np
 
 from app import (
+    ACKNOWLEDGEMENTS,
     AudioCache,
     FishAudioError,
     FishAudioSettings,
@@ -99,6 +100,7 @@ class RouterTests(unittest.TestCase):
             read_timeout=0.1,
             retries=1,
             retry_delay=0,
+            speed=0.97,
             fx_enabled=False,
         )
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -149,6 +151,23 @@ class RouterTests(unittest.TestCase):
             result = fish.synthesize(SynthesisRequest(text="Явний opt-in."))
         self.assertEqual(request.call_count, 2)
         self.assertEqual(result.model, "s2-pro")
+
+    def test_fish_cinematic_speed_is_used_by_streaming_and_wav_payloads(self) -> None:
+        fish = FishAudioService(self.fish_settings, JarvisFx(FxSettings.from_environment()))
+        request = SynthesisRequest(text="Перевірка швидкості.")
+        self.assertEqual(fish._payload(request, streaming=False)["prosody"]["speed"], 0.97)
+        self.assertEqual(fish._payload(request, streaming=True)["prosody"]["speed"], 0.97)
+        override = SynthesisRequest(text="Перевірка швидкості.", speed=1.02)
+        self.assertEqual(fish._payload(override, streaming=True)["prosody"]["speed"], 1.02)
+
+    def test_ack_pool_is_small_and_uses_cinematic_outcomes(self) -> None:
+        legacy: str = "".join(("п", "а", "н", "е"))
+        self.assertGreaterEqual(len(ACKNOWLEDGEMENTS), 4)
+        self.assertLessEqual(len(ACKNOWLEDGEMENTS), 6)
+        self.assertNotIn("working", ACKNOWLEDGEMENTS)
+        for phrase in ACKNOWLEDGEMENTS.values():
+            self.assertNotIn(legacy, phrase.casefold())
+            self.assertLessEqual(len(phrase.split()), 10)
 
     def test_reference_preset_is_stereo_and_keeps_duration(self) -> None:
         wav_bytes, mode, sample_rate = self.service.synthesize(

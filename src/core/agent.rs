@@ -19,17 +19,45 @@ use crate::{
 
 const SYSTEM_PROMPT: &str = r#"Ти JARVIS — персональний AI-асистент користувача Windows.
 
-Завжди відповідай українською мовою, навіть якщо користувач звернувся іншою мовою.
-Ти можеш керувати комп'ютером через доступні інструменти. Якщо доречний інструмент існує — використовуй його замість інструкцій користувачеві.
-Не стверджуй, що виконав дію, доки інструмент не підтвердив успіх. Якщо дія не вдалася, чесно і стисло поясни результат.
-Для складного запиту можеш послідовно викликати кілька інструментів. Не вигадуй назви, шляхи, процеси чи результати.
+МОВА І ЗВЕРТАННЯ
+Завжди відповідай природною українською мовою.
+Звертайся до користувача словом «сер», але лише зрідка й там, де це звучить природно. Не додавай звертання до кожної репліки.
+
+МАНЕРА
+Говори як стриманий кінематографічний AI-дворецький: спокійно, точно, інтелігентно й максимально лаконічно.
+Відразу переходь до суті. Не повторюй запит користувача й не перефразовуй його замість відповіді.
+Не додавай сервісних завершальних фраз, пропозицій подальшої допомоги чи нагадувань про свою присутність.
+Не будь театральним або пафосним. Не використовуй емодзі. Не став окличні знаки без потреби.
+Ледь помітна суха іронія дозволена рідко, лише доречно й не довше однієї короткої фрази. Не жартуй заради жарту.
+Пиши короткими завершеними реченнями з природними паузами для TTS. Не використовуй SSML.
+
+ДІЇ ТА БЕЗПЕКА
+Керуй комп'ютером через доступні інструменти, коли вони доречні.
+Не стверджуй, що виконав дію, доки інструмент не підтвердив успіх.
+Не вигадуй назви, шляхи, процеси, результати інструментів або факти.
 Перед закриттям програми, переміщенням або перезаписом файла переконайся, що саме цього просив користувач.
-Відповідай коротко, природно, спокійно й професійно. Не описуй технічні деталі простих виконаних дій.
-Манера мовлення нагадує стриманого кінематографічного AI-дворецького: точність, спокій, легка суха іронія та шанобливе «пане» там, де це звучить природно.
-Для привітань і підтверджень варіюй короткі фрази на кшталт: «Вітаю, пане. Усі системи готові», «До ваших послуг, пане», «Виконую», «Завдання завершено», «Системи працюють штатно».
-Для завершення відповіді іноді використовуй: «Готово, пане», «Як завжди, до ваших послуг», «Якщо знадоблюся — я поруч». Не повторюй одну формулу в кожній репліці й не перетворюй відповідь на театральний монолог.
-Коли ситуація ризикована, спокійно попередь про наслідки перед дією. Коли користувач помиляється, виправ його тактовно й без зверхності.
-Голосове введення може надходити після wake word «Джарвіс» через Whisper. AI-аналіз зображень наразі недоступний."#;
+При помилці або ризику спочатку спокійно назви факт, потім дай одну коротку рекомендацію.
+Якщо запит неоднозначний, постав одне коротке уточнення.
+
+АКТУАЛЬНІ ДАНІ
+У тебе немає інструмента вебпошуку чи перевіреного live-джерела.
+Не вигадуй актуальні новини, погоду, ціни, курси, спортивні результати, статуси сервісів або свіжі події.
+Коли потрібне актуальне джерело, прямо й коротко скажи, що його немає, і що ти не станеш вигадувати.
+
+БЮДЖЕТ ГОЛОСОВОЇ ВІДПОВІДІ
+Проста виконана дія: 2–10 слів.
+Просте питання: 1–2 короткі речення.
+Складне питання: не більше 3 коротких речень або орієнтовно 25–40 слів, якщо користувач явно не попросив деталі.
+Для потенційно довгої відповіді спочатку дай коротке резюме. Не озвучуй довгі списки без прямого прохання.
+Не скорочуй критичні застереження з безпеки.
+
+ОРІЄНТИРИ СТИЛЮ
+Привітання: «Вітаю, сер.»
+Стан систем: «Усі системи працюють штатно, сер.»
+Успішна дія: «YouTube відкрито.» або «Visual Studio Code відкрито, сер.»
+Немає live-джерела: «Актуального джерела новин у мене поки немає, сер. Не стану вигадувати.»
+Невдала дія: «Не вдалося відкрити програму, сер. Windows її не знайшла.»
+Рідкісна суха іронія: «Не цілком, сер. Але, підозрюю, це вас не зупинить.»"#;
 
 pub struct Agent {
     groq: GroqClient,
@@ -57,7 +85,17 @@ enum VoiceState {
     Speaking,
 }
 
-fn transition(state: &mut VoiceState, next: VoiceState, reason: &str) {
+fn listening_deadline(state: VoiceState, now: Instant, timeout: Duration) -> Option<Instant> {
+    (state == VoiceState::Listening).then_some(now + timeout)
+}
+
+fn transition(
+    state: &mut VoiceState,
+    conversation_deadline: &mut Option<Instant>,
+    next: VoiceState,
+    reason: &str,
+    timeout: Duration,
+) {
     if *state != next {
         if std::env::var("JARVIS_PROFILE")
             .map(|value| value.eq_ignore_ascii_case("debug"))
@@ -67,6 +105,7 @@ fn transition(state: &mut VoiceState, next: VoiceState, reason: &str) {
         }
         *state = next;
     }
+    *conversation_deadline = listening_deadline(next, Instant::now(), timeout);
 }
 
 impl Agent {
@@ -139,7 +178,9 @@ impl Agent {
     }
 
     async fn run_voice(&mut self, input: VoiceInputClient) -> Result<(), Box<dyn Error>> {
-        println!("Голосовий режим активний. Натисніть Ctrl+Alt+J. Ctrl+C — аварійний вихід.\n");
+        println!(
+            "Голосовий режим активний. Скажіть «Джарвіс» або натисніть Ctrl+Alt+J. Ctrl+C — аварійний вихід.\n"
+        );
         input.set_state(false, false).await?;
         let mut voice_state = VoiceState::Idle;
         let mut conversation_deadline: Option<Instant> = None;
@@ -151,10 +192,17 @@ impl Agent {
                 .min(Duration::from_secs(30));
 
             if wait.is_zero() {
-                conversation_deadline = None;
                 input.set_state(false, false).await?;
-                transition(&mut voice_state, VoiceState::Idle, "conversation_timeout");
-                println!("[Voice Input] Розмовну сесію завершено. Натисніть Ctrl+Alt+J.");
+                transition(
+                    &mut voice_state,
+                    &mut conversation_deadline,
+                    VoiceState::Idle,
+                    "conversation_timeout",
+                    self.conversation_timeout,
+                );
+                println!(
+                    "[Voice Input] Розмовну сесію завершено. Скажіть «Джарвіс» або натисніть Ctrl+Alt+J."
+                );
                 continue;
             }
 
@@ -175,15 +223,22 @@ impl Agent {
 
             match event {
                 VoiceEvent::Wake => {
-                    transition(&mut voice_state, VoiceState::Activated, "activation_event");
-                    conversation_deadline = Some(Instant::now() + self.conversation_timeout);
+                    transition(
+                        &mut voice_state,
+                        &mut conversation_deadline,
+                        VoiceState::Activated,
+                        "activation_event",
+                        self.conversation_timeout,
+                    );
                     println!("[Voice Input] Слухаю...");
                     if self.voice.is_some() {
                         input.set_state(true, true).await?;
                         transition(
                             &mut voice_state,
+                            &mut conversation_deadline,
                             VoiceState::Speaking,
                             "local_activation_cue",
+                            self.conversation_timeout,
                         );
                         if let Err(error) = tokio::task::spawn_blocking(play_activation_cue)
                             .await
@@ -195,9 +250,34 @@ impl Agent {
                     input.set_state(true, false).await?;
                     transition(
                         &mut voice_state,
+                        &mut conversation_deadline,
                         VoiceState::Listening,
                         "activation_cue_complete",
+                        self.conversation_timeout,
                     );
+                }
+                VoiceEvent::SpeechStarted => {
+                    if voice_state == VoiceState::Listening {
+                        transition(
+                            &mut voice_state,
+                            &mut conversation_deadline,
+                            VoiceState::Transcribing,
+                            "speech_started",
+                            self.conversation_timeout,
+                        );
+                    }
+                }
+                VoiceEvent::Listening => {
+                    if voice_state == VoiceState::Transcribing {
+                        input.set_state(true, false).await?;
+                        transition(
+                            &mut voice_state,
+                            &mut conversation_deadline,
+                            VoiceState::Listening,
+                            "stt_filtered_or_empty",
+                            self.conversation_timeout,
+                        );
+                    }
                 }
                 VoiceEvent::Transcript {
                     text,
@@ -207,11 +287,21 @@ impl Agent {
                 } => {
                     transition(
                         &mut voice_state,
+                        &mut conversation_deadline,
                         VoiceState::Transcribing,
                         "transcript_received",
+                        self.conversation_timeout,
                     );
                     let text = clean_wake_word(&text);
                     if text.is_empty() {
+                        input.set_state(true, false).await?;
+                        transition(
+                            &mut voice_state,
+                            &mut conversation_deadline,
+                            VoiceState::Listening,
+                            "empty_transcript",
+                            self.conversation_timeout,
+                        );
                         continue;
                     }
                     println!("Ви: {text}");
@@ -220,8 +310,10 @@ impl Agent {
                         let tool_start = unix_ms();
                         transition(
                             &mut voice_state,
+                            &mut conversation_deadline,
                             VoiceState::Executing,
                             "fast_intent_matched",
+                            self.conversation_timeout,
                         );
                         let tools = self.tools.clone();
                         let intent = command.intent;
@@ -242,8 +334,6 @@ impl Agent {
                             command.intent, command.arguments
                         );
                         println!("\nJARVIS: {answer}\n");
-                        conversation_deadline = Some(Instant::now() + self.conversation_timeout);
-
                         let tts_start = self.voice.as_ref().map(|_| unix_ms());
                         log_fast_latency(
                             mic_end_unix_ms,
@@ -258,16 +348,31 @@ impl Agent {
                         if let Some(voice) = self.voice.clone() {
                             transition(
                                 &mut voice_state,
+                                &mut conversation_deadline,
                                 VoiceState::Speaking,
                                 "fast_acknowledgement",
+                                self.conversation_timeout,
                             );
-                            let playback = if answer == command.acknowledgement {
+                            let playback = if answer == command.acknowledgement
+                                && command.acknowledgement_cache.is_some()
+                            {
                                 input.set_state(true, true).await?;
-                                if let Err(error) = voice.speak_ack("working").await {
-                                    eprintln!("[Voice Core] {error}");
+                                match voice
+                                    .speak_ack(command.acknowledgement_cache.unwrap_or("done"))
+                                    .await
+                                {
+                                    Ok(true) => {
+                                        let _ = input.set_state(true, false).await;
+                                        PlaybackOutcome::Completed
+                                    }
+                                    Ok(false) => {
+                                        self.speak_with_barge_in(&input, &voice, &answer).await
+                                    }
+                                    Err(error) => {
+                                        eprintln!("[Voice Core] {error}");
+                                        self.speak_with_barge_in(&input, &voice, &answer).await
+                                    }
                                 }
-                                let _ = input.set_state(true, false).await;
-                                PlaybackOutcome::Completed
                             } else {
                                 self.speak_with_barge_in(&input, &voice, &answer).await
                             };
@@ -282,15 +387,19 @@ impl Agent {
                             }
                             transition(
                                 &mut voice_state,
+                                &mut conversation_deadline,
                                 VoiceState::Listening,
                                 "fast_ack_complete",
+                                self.conversation_timeout,
                             );
                         } else {
                             input.set_state(true, false).await?;
                             transition(
                                 &mut voice_state,
+                                &mut conversation_deadline,
                                 VoiceState::Listening,
                                 "tool_complete_no_tts",
+                                self.conversation_timeout,
                             );
                         }
                         continue;
@@ -298,9 +407,15 @@ impl Agent {
                     // LLM fallback keeps the microphone closed while the agent
                     // thinks and performs tools, not only during audible TTS.
                     input.set_state(true, true).await?;
-                    transition(&mut voice_state, VoiceState::Executing, "llm_fallback");
+                    transition(
+                        &mut voice_state,
+                        &mut conversation_deadline,
+                        VoiceState::Executing,
+                        "llm_fallback",
+                        self.conversation_timeout,
+                    );
                     let llm_started = unix_ms();
-                    match self.respond(&text).await {
+                    match self.respond_voice(&text).await {
                         Ok(answer) => {
                             let llm_done = unix_ms();
                             println!(
@@ -309,13 +424,13 @@ impl Agent {
                                 llm_done.saturating_sub(llm_started)
                             );
                             println!("\nJARVIS: {answer}\n");
-                            conversation_deadline =
-                                Some(Instant::now() + self.conversation_timeout);
                             if let Some(voice) = self.voice.clone() {
                                 transition(
                                     &mut voice_state,
+                                    &mut conversation_deadline,
                                     VoiceState::Speaking,
                                     "llm_response_ready",
+                                    self.conversation_timeout,
                                 );
                                 match self.speak_with_barge_in(&input, &voice, &answer).await {
                                     PlaybackOutcome::Transcript(interrupted_text)
@@ -323,7 +438,7 @@ impl Agent {
                                     {
                                         println!("Ви (перебивання): {interrupted_text}");
                                         input.set_state(true, true).await?;
-                                        match self.respond(&interrupted_text).await {
+                                        match self.respond_voice(&interrupted_text).await {
                                             Ok(new_answer) => {
                                                 println!("\nJARVIS: {new_answer}\n");
                                                 if matches!(
@@ -354,25 +469,48 @@ impl Agent {
                                 }
                                 transition(
                                     &mut voice_state,
+                                    &mut conversation_deadline,
                                     VoiceState::Listening,
                                     "llm_playback_complete",
+                                    self.conversation_timeout,
                                 );
                             } else {
                                 input.set_state(true, false).await?;
                                 transition(
                                     &mut voice_state,
+                                    &mut conversation_deadline,
                                     VoiceState::Listening,
                                     "llm_complete_no_tts",
+                                    self.conversation_timeout,
                                 );
                             }
                         }
                         Err(error) => {
                             eprintln!("\nJARVIS: Сталася помилка: {error}\n");
                             input.set_state(true, false).await?;
+                            transition(
+                                &mut voice_state,
+                                &mut conversation_deadline,
+                                VoiceState::Listening,
+                                "llm_error",
+                                self.conversation_timeout,
+                            );
                         }
                     }
                 }
-                VoiceEvent::Error { message } => eprintln!("[Voice Input] {message}"),
+                VoiceEvent::Error { message } => {
+                    eprintln!("[Voice Input] {message}");
+                    if voice_state == VoiceState::Transcribing {
+                        input.set_state(true, false).await?;
+                        transition(
+                            &mut voice_state,
+                            &mut conversation_deadline,
+                            VoiceState::Listening,
+                            "stt_error",
+                            self.conversation_timeout,
+                        );
+                    }
+                }
                 VoiceEvent::Stopped => {
                     println!(
                         "[Voice Input] Прослуховування зупинено. Переходжу в текстовий режим."
@@ -433,17 +571,41 @@ impl Agent {
     }
 
     async fn respond(&mut self, input: &str) -> Result<String, Box<dyn Error>> {
+        self.respond_with_mode(input, false).await
+    }
+
+    async fn respond_voice(&mut self, input: &str) -> Result<String, Box<dyn Error>> {
+        self.respond_with_mode(input, true).await
+    }
+
+    async fn respond_with_mode(
+        &mut self,
+        input: &str,
+        voice_mode: bool,
+    ) -> Result<String, Box<dyn Error>> {
+        if let Some(answer) = guarded_local_answer(input) {
+            self.history.push(Message::user(input));
+            self.history.push(Message::assistant(answer));
+            return Ok(answer.to_owned());
+        }
         self.history.push(Message::user(input));
 
         for _ in 0..self.max_tool_rounds {
-            let message = self.groq.chat(&self.history, &self.tools).await?;
+            let mut message = self.groq.chat(&self.history, &self.tools).await?;
             let tool_calls = message.tool_calls.clone().unwrap_or_default();
             let content = message.content.clone();
-            self.history.push(message);
 
             if tool_calls.is_empty() {
-                return Ok(content.unwrap_or_else(|| "Готово.".to_owned()));
+                let answer = finalize_assistant_response(
+                    input,
+                    &content.unwrap_or_else(|| "Готово.".to_owned()),
+                    voice_mode,
+                );
+                message.content = Some(answer.clone());
+                self.history.push(message);
+                return Ok(answer);
             }
+            self.history.push(message);
 
             for call in tool_calls {
                 let tool_started = unix_ms();
@@ -466,6 +628,207 @@ impl Agent {
 
         Err(io::Error::other("Перевищено ліміт послідовних викликів інструментів").into())
     }
+}
+
+fn guarded_local_answer(input: &str) -> Option<&'static str> {
+    let text = normalize_for_guard(input);
+    if matches!(
+        text.as_str(),
+        "привіт" | "вітаю" | "добрий день" | "добрий вечір"
+    ) {
+        return Some("Вітаю, сер.");
+    }
+    if text.contains("як себе")
+        || text.contains("як почуваєшся")
+        || text.contains("як ти почуваєшся")
+    {
+        return Some("Усі системи працюють штатно, сер.");
+    }
+
+    let asks_now = [
+        "зараз",
+        "сьогодні",
+        "актуаль",
+        "останні",
+        "свіжі",
+        "що по",
+        "які новини",
+        "яка погода",
+        "який курс",
+        "яка ціна",
+        "скільки коштує",
+        "хто виграв",
+        "який рахунок",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    let short_live_query = text.split_whitespace().count() <= 4
+        && !["історія", "що таке", "чому", "як працює"]
+            .iter()
+            .any(|marker| text.contains(marker));
+    let requires_live_source = asks_now || short_live_query;
+
+    if text.contains("новин") && requires_live_source {
+        return Some("Актуального джерела новин у мене поки немає, сер. Не стану вигадувати.");
+    }
+    if text.contains("погод") && requires_live_source {
+        return Some("Актуального джерела погоди у мене поки немає, сер. Не стану вигадувати.");
+    }
+    if requires_live_source
+        && (text.contains("курс долара")
+            || text.contains("курс євро")
+            || text.contains("ціна")
+            || text.contains("коштує")
+            || text.contains("біткоїн")
+            || text.contains("bitcoin"))
+    {
+        return Some(
+            "Актуального джерела цін і курсів у мене поки немає, сер. Не стану вигадувати.",
+        );
+    }
+    if requires_live_source
+        && (text.contains("рахунок")
+            || text.contains("матч")
+            || text.contains("турнір")
+            || text.contains("виграв"))
+    {
+        return Some(
+            "Актуального спортивного джерела у мене поки немає, сер. Не стану вигадувати.",
+        );
+    }
+    if requires_live_source
+        && (text.contains("статус сервіс")
+            || text.contains("працює сервіс")
+            || text.contains("лежить сервіс"))
+    {
+        return Some(
+            "Актуального джерела статусу сервісів у мене поки немає, сер. Не стану вигадувати.",
+        );
+    }
+    None
+}
+
+fn normalize_for_guard(input: &str) -> String {
+    input
+        .to_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn finalize_assistant_response(input: &str, answer: &str, voice_mode: bool) -> String {
+    let answer = replace_legacy_address(answer);
+    let answer = remove_generic_outro(&answer);
+    let answer = if is_echo_response(input, &answer) {
+        "Потрібне коротке уточнення, сер.".to_owned()
+    } else {
+        answer
+    };
+    if voice_mode {
+        enforce_voice_budget(input, &answer)
+    } else {
+        answer
+    }
+}
+
+fn replace_legacy_address(answer: &str) -> String {
+    let lower: String = ['п', 'а', 'н', 'е'].into_iter().collect();
+    let title: String = ['П', 'а', 'н', 'е'].into_iter().collect();
+    answer.replace(&title, "Сер").replace(&lower, "сер")
+}
+
+fn remove_generic_outro(answer: &str) -> String {
+    let lower = answer.to_lowercase();
+    let cut_at = [
+        "якщо потрібно",
+        "якщо знадоблюся",
+        "дайте знати",
+        "я поруч",
+        "до ваших послуг",
+        "чим ще можу допомогти",
+        "звертайтесь",
+    ]
+    .iter()
+    .filter_map(|marker| lower.find(marker))
+    .min();
+    let cleaned = cut_at.map_or(answer, |index| &answer[..index]).trim();
+    if cleaned.is_empty() {
+        "Готово.".to_owned()
+    } else {
+        cleaned.to_owned()
+    }
+}
+
+fn is_echo_response(input: &str, answer: &str) -> bool {
+    let input = normalize_for_guard(input);
+    let answer_normalized = normalize_for_guard(answer);
+    if input.is_empty() || answer_normalized.is_empty() {
+        return false;
+    }
+    if input == answer_normalized {
+        return true;
+    }
+    let answer_is_question = answer.trim_end().ends_with('?');
+    let input_words: Vec<_> = input.split_whitespace().collect();
+    let answer_words: Vec<_> = answer_normalized.split_whitespace().collect();
+    let shared = input_words
+        .iter()
+        .filter(|word| answer_words.contains(word))
+        .count();
+    answer_is_question && shared * 5 >= input_words.len() * 4
+}
+
+fn enforce_voice_budget(input: &str, answer: &str) -> String {
+    let request = normalize_for_guard(input);
+    if [
+        "детально",
+        "докладно",
+        "повністю",
+        "розгорнуто",
+        "усі подробиці",
+    ]
+    .iter()
+    .any(|marker| request.contains(marker))
+        || ["небезп", "ризик", "втрата даних", "видал", "перезапис"]
+            .iter()
+            .any(|marker| answer.to_lowercase().contains(marker))
+    {
+        return answer.to_owned();
+    }
+
+    let mut sentence_ends = 0;
+    let mut end_index = answer.len();
+    for (index, character) in answer.char_indices() {
+        if matches!(character, '.' | '!' | '?') {
+            sentence_ends += 1;
+            if sentence_ends == 3 {
+                end_index = index + character.len_utf8();
+                break;
+            }
+        }
+    }
+    let concise = answer[..end_index].trim();
+    let words: Vec<_> = concise.split_whitespace().collect();
+    if words.len() <= 45 {
+        return concise.to_owned();
+    }
+    let mut shortened = words[..40].join(" ");
+    while shortened.ends_with([',', ';', ':', '—', '-']) {
+        shortened.pop();
+    }
+    if !shortened.ends_with(['.', '!', '?']) {
+        shortened.push('.');
+    }
+    shortened
 }
 
 fn clean_wake_word(text: &str) -> String {
@@ -596,17 +959,27 @@ fn fast_answer(intent: &str, result: &str, acknowledgement: &str) -> String {
         }
         acknowledgement.to_owned()
     } else {
-        payload
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("Не вдалося виконати команду.")
-            .to_owned()
+        match intent {
+            "open_app" => "Не вдалося відкрити програму, сер. Windows її не знайшла.".to_owned(),
+            "open_url" => "Не вдалося відкрити сайт, сер.".to_owned(),
+            "close_app" => "Не вдалося закрити програму, сер.".to_owned(),
+            _ => payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Не вдалося виконати команду.")
+                .to_owned(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_wake_word, fast_answer};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        SYSTEM_PROMPT, VoiceState, clean_wake_word, fast_answer, finalize_assistant_response,
+        guarded_local_answer, listening_deadline, transition,
+    };
     use crate::core::fast_command::match_fast_command;
 
     #[test]
@@ -631,9 +1004,82 @@ mod tests {
             fast_answer(command.intent, tool_result, command.acknowledgement),
             command.acknowledgement
         );
-        assert!(matches!(
-            command.acknowledgement,
-            "Виконую, пане." | "Виконую."
-        ));
+        assert_eq!(command.acknowledgement, "Відкрито.");
+        assert_eq!(command.acknowledgement_cache, Some("opened"));
+    }
+
+    #[test]
+    fn current_data_without_source_is_guarded_locally() {
+        assert_eq!(
+            guarded_local_answer("Що по новинах?"),
+            Some("Актуального джерела новин у мене поки немає, сер. Не стану вигадувати.")
+        );
+        assert!(guarded_local_answer("Новини").is_some());
+        assert!(guarded_local_answer("Історія новин України").is_none());
+        assert!(guarded_local_answer("Розкажи історію газет").is_none());
+    }
+
+    #[test]
+    fn system_health_question_is_answered_without_echo() {
+        assert_eq!(
+            guarded_local_answer("Як себе чувствуєш?"),
+            Some("Усі системи працюють штатно, сер.")
+        );
+    }
+
+    #[test]
+    fn cinematic_guard_removes_legacy_address_and_generic_outro() {
+        let legacy: String = ['п', 'а', 'н', 'е'].into_iter().collect();
+        let outro = ["Як", "що потрібно щось ще, дайте", " знати."].concat();
+        let raw = format!("Готово, {legacy}. {outro}");
+        let answer = finalize_assistant_response("Відкрий програму", &raw, true);
+        assert_eq!(answer, "Готово, сер.");
+        assert!(!answer.contains(&legacy));
+        assert!(!SYSTEM_PROMPT.contains(&legacy));
+    }
+
+    #[test]
+    fn voice_budget_caps_unrequested_long_answers() {
+        let answer = finalize_assistant_response(
+            "Поясни коротко",
+            "Перше речення. Друге речення. Третє речення. Четверте речення. П'яте речення.",
+            true,
+        );
+        assert_eq!(answer, "Перше речення. Друге речення. Третє речення.");
+    }
+
+    #[test]
+    fn idle_timeout_only_exists_while_listening() {
+        let timeout = Duration::from_secs(60);
+        let activated_at = Instant::now();
+        assert!(listening_deadline(VoiceState::Activated, activated_at, timeout).is_none());
+        let first_listening = listening_deadline(VoiceState::Listening, activated_at, timeout)
+            .expect("listening needs a deadline");
+        assert_eq!(first_listening, activated_at + timeout);
+
+        for speaking_secs in [30, 40, 90, 120] {
+            let speaking_at = activated_at + Duration::from_secs(5);
+            assert!(listening_deadline(VoiceState::Speaking, speaking_at, timeout).is_none());
+            let playback_done = speaking_at + Duration::from_secs(speaking_secs);
+            let refreshed = listening_deadline(VoiceState::Listening, playback_done, timeout)
+                .expect("deadline must restart after playback");
+            assert_eq!(refreshed, playback_done + timeout);
+            assert!(refreshed > first_listening);
+        }
+
+        let mut state = VoiceState::Speaking;
+        let mut deadline = None;
+        transition(
+            &mut state,
+            &mut deadline,
+            VoiceState::Listening,
+            "synthetic_playback_complete",
+            timeout,
+        );
+        assert_eq!(state, VoiceState::Listening);
+        let remaining = deadline
+            .expect("transition must create a fresh deadline")
+            .saturating_duration_since(Instant::now());
+        assert!(remaining > timeout - Duration::from_millis(50));
     }
 }

@@ -6,7 +6,7 @@ const DEFAULT_MODEL: &str = "openai/gpt-oss-20b";
 const DEFAULT_MAX_TOOL_ROUNDS: usize = 8;
 const DEFAULT_TTS_URL: &str = "http://127.0.0.1:8765";
 const DEFAULT_VOICE_INPUT_URL: &str = "http://127.0.0.1:8766";
-const DEFAULT_CONVERSATION_TIMEOUT_SECS: u64 = 25;
+const DEFAULT_CONVERSATION_TIMEOUT_SECS: u64 = 60;
 
 pub struct Config {
     pub groq_api_key: String,
