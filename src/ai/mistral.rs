@@ -8,10 +8,10 @@ pub fn client(
     read: Duration,
 ) -> OpenAiCompatibleClient {
     OpenAiCompatibleClient::new(
-        ProviderKind::Groq,
+        ProviderKind::Mistral,
         api_key,
         model,
-        "https://api.groq.com/openai/v1/chat/completions".to_owned(),
+        "https://api.mistral.ai/v1/chat/completions".to_owned(),
         connect,
         read,
     )

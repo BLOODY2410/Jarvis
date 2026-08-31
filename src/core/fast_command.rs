@@ -29,6 +29,26 @@ pub fn match_fast_command(input: &str) -> Option<FastCommand> {
             None,
         );
     }
+    if ["включи музику", "увімкни музику"]
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+        && [
+            "яка тобі нравиться",
+            "яка тобі подобається",
+            "яку ти любиш",
+            "на свій смак",
+            "якусь музику",
+        ]
+        .iter()
+        .any(|tail| text.contains(tail))
+    {
+        return command(
+            "play_youtube_music",
+            json!({}),
+            "Музику запущено в YouTube Music.",
+            None,
+        );
+    }
     if matches_any(
         &text,
         &[
@@ -46,8 +66,15 @@ pub fn match_fast_command(input: &str) -> Option<FastCommand> {
             None,
         );
     }
-    if matches_any(&text, &["постав на паузу", "пауза", "призупини музику"])
-    {
+    if matches_any(
+        &text,
+        &[
+            "постав на паузу",
+            "постав музику на паузу",
+            "пауза",
+            "призупини музику",
+        ],
+    ) {
         return command("pause_media", json!({}), "Відтворення призупинено.", None);
     }
     if matches_any(
@@ -137,7 +164,9 @@ pub fn match_fast_command(input: &str) -> Option<FastCommand> {
         &[
             "зроби скріншот",
             "зроби знімок екрана",
+            "зроби знімок екрану",
             "знімок екрана",
+            "знімок екрану",
             "скріншот",
         ],
     ) {
@@ -644,6 +673,13 @@ mod tests {
         assert_eq!(intent("увімкни звук"), Some("unmute"));
         assert_eq!(intent("що запущено"), Some("get_running_apps"));
         assert_eq!(intent("зроби скріншот"), Some("take_screenshot"));
+        assert_eq!(intent("зроби знімок екрану"), Some("take_screenshot"));
+        assert_eq!(
+            intent("включи музику яка тобі нравиться"),
+            Some("play_youtube_music")
+        );
+        let music = match_fast_command("Включи музику, яка тобі нравиться").unwrap();
+        assert_ne!(music.intent, "open_app");
     }
 
     #[test]

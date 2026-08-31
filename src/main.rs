@@ -8,29 +8,31 @@ mod voice_input;
 use std::error::Error;
 
 use crate::{
-    ai::GroqClient, config::Config, core::Agent, voice::VoiceClient, voice_input::VoiceInputClient,
+    ai::build_router, config::Config, core::Agent, voice::VoiceClient,
+    voice_input::VoiceInputClient,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    if std::env::args().any(|argument| argument == "--router-benchmark") {
+        return core::router_benchmark::run(None).await;
+    }
     let config = Config::from_env()?;
-    let groq = GroqClient::new(
-        config.groq_api_key,
-        config.groq_model,
-        config.groq_max_retries,
-        config.groq_max_completion_tokens,
-    );
+    let mut router = build_router(&config);
+    if std::env::args().any(|argument| argument == "--router-benchmark-live") {
+        return core::router_benchmark::run(Some(&mut router)).await;
+    }
     let voice = config.tts_enabled.then(|| VoiceClient::new(config.tts_url));
     let voice_input = config
         .voice_input_enabled
         .then(|| VoiceInputClient::new(config.voice_input_url));
     let mut agent = Agent::new(
-        groq,
+        router,
         voice,
         voice_input,
         config.max_tool_rounds,
         config.conversation_timeout_secs,
-        config.groq_max_context_turns,
+        config.max_context_turns,
     );
 
     agent.run().await

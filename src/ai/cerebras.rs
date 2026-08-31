@@ -8,10 +8,10 @@ pub fn client(
     read: Duration,
 ) -> OpenAiCompatibleClient {
     OpenAiCompatibleClient::new(
-        ProviderKind::Groq,
+        ProviderKind::Cerebras,
         api_key,
         model,
-        "https://api.groq.com/openai/v1/chat/completions".to_owned(),
+        "https://api.cerebras.ai/v1/chat/completions".to_owned(),
         connect,
         read,
     )

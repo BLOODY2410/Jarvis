@@ -19,3 +19,20 @@ function Show-Service([string]$Name, [int]$Port) {
 
 Show-Service 'voice-service' 8765
 Show-Service 'voice-input' 8766
+
+$envPath = Join-Path $PSScriptRoot '.env'
+if (Test-Path -LiteralPath $envPath) {
+    $settings = @{}
+    foreach ($line in Get-Content -LiteralPath $envPath) {
+        if ($line -match '^\s*([^#=]+)=(.*)$') { $settings[$matches[1].Trim()] = $matches[2].Trim() }
+    }
+    $configured = @()
+    foreach ($provider in @(@('cerebras','CEREBRAS_API_KEY'), @('gemini','GEMINI_API_KEY'), @('groq','GROQ_API_KEY'), @('openrouter','OPENROUTER_API_KEY'), @('mistral','MISTRAL_API_KEY'))) {
+        $value = $settings[$provider[1]]
+        if ($value -and $value -notin @('replace_me','changeme')) { $configured += $provider[0] }
+    }
+    $pc = if ($settings['JARVIS_PC_BRAIN_PROVIDER']) { $settings['JARVIS_PC_BRAIN_PROVIDER'] } else { 'cerebras' }
+    $chat = if ($settings['JARVIS_CHAT_BRAIN_PROVIDER']) { $settings['JARVIS_CHAT_BRAIN_PROVIDER'] } else { 'gemini' }
+    $live = if ($settings['JARVIS_LIVE_BRAIN_PROVIDER']) { $settings['JARVIS_LIVE_BRAIN_PROVIDER'] } else { 'gemini' }
+    Write-Host "AI Router: pc=$pc, chat=$chat, live=$live, configured=$($configured -join ',')"
+}

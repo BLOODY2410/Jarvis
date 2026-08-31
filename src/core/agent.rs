@@ -10,7 +10,10 @@ use std::{
 };
 
 use crate::{
-    ai::GroqClient,
+    ai::{
+        context::ConversationContext,
+        router::{AiRoute, AiRouter},
+    },
     core::fast_command::match_fast_command,
     core::messages::Message,
     tools::ToolRegistry,
@@ -41,9 +44,8 @@ const SYSTEM_PROMPT: &str = r#"Ти JARVIS — персональний AI-ас�
 Якщо запит неоднозначний, постав одне коротке уточнення.
 
 АКТУАЛЬНІ ДАНІ
-У тебе немає інструмента вебпошуку чи перевіреного live-джерела.
-Не вигадуй актуальні новини, погоду, ціни, курси, спортивні результати, статуси сервісів або свіжі події.
-Коли потрібне актуальне джерело, прямо й коротко скажи, що його немає, і що ти не станеш вигадувати.
+Використовуй актуальні факти лише тоді, коли поточний маршрут надав перевірені результати Google Search і grounding metadata.
+Не вигадуй актуальні новини, погоду, ціни, курси, спортивні результати, статуси сервісів або свіжі події. Якщо live-джерело недоступне, прямо й коротко скажи про це.
 
 БЮДЖЕТ ГОЛОСОВОЇ ВІДПОВІДІ
 Проста виконана дія: 2–10 слів.
@@ -63,14 +65,13 @@ const NORMAL_SHUTDOWN_MESSAGE: &str = "До зустрічі, сер.";
 const EMERGENCY_SHUTDOWN_MESSAGE: &str = "Прослуховування аварійно припинено.";
 
 pub struct Agent {
-    groq: GroqClient,
+    ai_router: AiRouter,
     tools: ToolRegistry,
-    history: Vec<Message>,
+    context: ConversationContext,
     max_tool_rounds: usize,
     voice: Option<VoiceClient>,
     voice_input: Option<VoiceInputClient>,
     conversation_timeout: Duration,
-    max_context_turns: usize,
 }
 
 enum PlaybackOutcome {
@@ -131,7 +132,7 @@ fn transition(
 
 impl Agent {
     pub fn new(
-        groq: GroqClient,
+        ai_router: AiRouter,
         voice: Option<VoiceClient>,
         voice_input: Option<VoiceInputClient>,
         max_tool_rounds: usize,
@@ -139,19 +140,19 @@ impl Agent {
         max_context_turns: usize,
     ) -> Self {
         Self {
-            groq,
+            ai_router,
             tools: ToolRegistry::new(),
-            history: vec![Message::system(SYSTEM_PROMPT)],
+            context: ConversationContext::new(SYSTEM_PROMPT, max_context_turns),
             max_tool_rounds,
             voice,
             voice_input,
             conversation_timeout: Duration::from_secs(conversation_timeout_secs),
-            max_context_turns,
         }
     }
 
     pub async fn run(&mut self) -> Result<(), Box<dyn Error>> {
         println!("JARVIS Desktop Core запущено.");
+        println!("{}", self.ai_router.status());
         if let Some(input) = self.voice_input.clone() {
             match input.health().await {
                 Ok(()) => return self.run_voice(input).await,
@@ -247,6 +248,7 @@ impl Agent {
 
             match event {
                 VoiceEvent::Wake => {
+                    self.context.set_session_active(true);
                     transition(
                         &mut voice_state,
                         &mut conversation_deadline,
@@ -330,6 +332,14 @@ impl Agent {
                     }
                     println!("Ви: {text}");
                     if let Some(control) = match_local_control(&text) {
+                        if matches!(
+                            control,
+                            LocalControl::EndSession
+                                | LocalControl::SleepAssistant
+                                | LocalControl::ShutdownAssistant
+                        ) {
+                            self.context.set_session_active(false);
+                        }
                         input.set_state(false, true).await?;
                         let (answer, idle_after, shutdown_core) = match control {
                             LocalControl::EndSession => {
@@ -443,6 +453,10 @@ impl Agent {
                             tokio::task::spawn_blocking(move || tools.execute(intent, &arguments));
                         input.set_state(true, true).await?;
                         let result = tool_task.await.map_err(io::Error::other)?;
+                        if result.contains(r#""success":true"#) {
+                            self.context
+                                .record_event(format!("{} {}", command.intent, command.arguments));
+                        }
                         let tool_done = unix_ms();
                         let answer = fast_answer(command.intent, &result, command.acknowledgement);
                         println!(
@@ -722,32 +736,69 @@ impl Agent {
         input: &str,
         voice_mode: bool,
     ) -> Result<String, Box<dyn Error>> {
+        let normalized = normalize_for_guard(input);
+        if normalized == "статус ai router" || normalized == "статус аі роутера"
+        {
+            return Ok(self.ai_router.status());
+        }
+        if let Some(command) = match_fast_command(input) {
+            let result = self.tools.execute(command.intent, &command.arguments);
+            let answer = fast_answer(command.intent, &result, command.acknowledgement);
+            if result.contains(r#""success":true"#) {
+                self.context
+                    .record_event(format!("{} {}", command.intent, command.arguments));
+            }
+            return Ok(answer);
+        }
         if let Some(answer) = guarded_local_answer(input) {
             return Ok(answer.to_owned());
         }
-        if looks_like_uncertain_computer_command(input) {
+        let route = AiRouter::classify(input);
+        if looks_like_uncertain_computer_command(input) && route != AiRoute::ComputerAgent {
             return Ok("Не розібрав команду, сер. Повторіть.".to_owned());
         }
-        self.history.push(Message::user(input));
+        self.context.push_user(input);
 
         for _ in 0..self.max_tool_rounds {
-            let context = context_window(&self.history, self.max_context_turns);
-            let mut message = self.groq.chat(&context, &self.tools).await?;
+            let context = self.context.window();
+            let detailed = ["детально", "докладно", "розгорнуто", "повністю"]
+                .iter()
+                .any(|marker| input.to_lowercase().contains(marker));
+            let response = self
+                .ai_router
+                .complete(
+                    route,
+                    &context,
+                    (route == AiRoute::ComputerAgent).then(|| self.tools.schemas()),
+                    voice_mode,
+                    detailed,
+                )
+                .await?;
+            let sources = response.sources;
+            let mut message = response.message;
             let tool_calls = message.tool_calls.clone().unwrap_or_default();
             let content = message.content.clone();
 
             if tool_calls.is_empty() {
-                let answer = finalize_assistant_response(
+                let mut answer = finalize_assistant_response(
                     input,
                     &content.unwrap_or_else(|| "Готово.".to_owned()),
                     voice_mode,
                 );
+                if route == AiRoute::LiveCurrent && !voice_mode && !sources.is_empty() {
+                    let citations = sources
+                        .iter()
+                        .take(3)
+                        .map(|source| format!("{} — {}", source.title, source.url))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    answer.push_str(&format!("\nДжерела: {citations}"));
+                }
                 message.content = Some(answer.clone());
-                self.history.push(message);
-                prune_history(&mut self.history, self.max_context_turns);
+                self.context.push_assistant(message);
                 return Ok(answer);
             }
-            self.history.push(message);
+            self.context.push_assistant(message);
 
             for call in tool_calls {
                 let tool_started = unix_ms();
@@ -764,7 +815,8 @@ impl Agent {
                     call.function.name,
                     tool_done.saturating_sub(tool_started)
                 );
-                self.history.push(Message::tool(call.id, result));
+                self.context
+                    .push_tool(compact_tool_message(&Message::tool(call.id, result)));
             }
         }
 
@@ -778,7 +830,7 @@ fn match_local_control(input: &str) -> Option<LocalControl> {
         "завершити розмову" | "закінчити розмову" | "досить" | "на цьому все" => {
             Some(LocalControl::EndSession)
         }
-        "іди в sleep mode" | "засни" | "сплячий режим" => {
+        "іди в sleep mode" | "засни" | "заснею" | "заснив" | "засній" | "сплячий режим" => {
             Some(LocalControl::SleepAssistant)
         }
         "вимкнись" | "заверши роботу" | "вимкни jarvis" | "вимкни джарвіс" => {
@@ -858,66 +910,6 @@ fn guarded_local_answer(input: &str) -> Option<&'static str> {
         return Some("Зрозумів.");
     }
 
-    let asks_now = [
-        "зараз",
-        "сьогодні",
-        "актуаль",
-        "останні",
-        "свіжі",
-        "що по",
-        "які новини",
-        "яка погода",
-        "який курс",
-        "яка ціна",
-        "скільки коштує",
-        "хто виграв",
-        "який рахунок",
-    ]
-    .iter()
-    .any(|marker| text.contains(marker));
-    let short_live_query = text.split_whitespace().count() <= 4
-        && !["історія", "що таке", "чому", "як працює"]
-            .iter()
-            .any(|marker| text.contains(marker));
-    let requires_live_source = asks_now || short_live_query;
-
-    if text.contains("новин") && requires_live_source {
-        return Some("Актуального джерела новин у мене поки немає, сер. Не стану вигадувати.");
-    }
-    if text.contains("погод") && requires_live_source {
-        return Some("Актуального джерела погоди у мене поки немає, сер. Не стану вигадувати.");
-    }
-    if requires_live_source
-        && (text.contains("курс долара")
-            || text.contains("курс євро")
-            || text.contains("ціна")
-            || text.contains("коштує")
-            || text.contains("біткоїн")
-            || text.contains("bitcoin"))
-    {
-        return Some(
-            "Актуального джерела цін і курсів у мене поки немає, сер. Не стану вигадувати.",
-        );
-    }
-    if requires_live_source
-        && (text.contains("рахунок")
-            || text.contains("матч")
-            || text.contains("турнір")
-            || text.contains("виграв"))
-    {
-        return Some(
-            "Актуального спортивного джерела у мене поки немає, сер. Не стану вигадувати.",
-        );
-    }
-    if requires_live_source
-        && (text.contains("статус сервіс")
-            || text.contains("працює сервіс")
-            || text.contains("лежить сервіс"))
-    {
-        return Some(
-            "Актуального джерела статусу сервісів у мене поки немає, сер. Не стану вигадувати.",
-        );
-    }
     None
 }
 
@@ -955,6 +947,9 @@ fn finalize_assistant_response(input: &str, answer: &str, voice_mode: bool) -> S
 }
 
 fn looks_like_uncertain_computer_command(input: &str) -> bool {
+    if AiRouter::classify(input) == AiRoute::ComputerAgent {
+        return false;
+    }
     let text = normalize_for_guard(input);
     let first = text.split_whitespace().next().unwrap_or_default();
     let commandish = [
@@ -999,6 +994,7 @@ fn bounded_distance(left: &str, right: &str, limit: usize) -> usize {
     previous[right.len()]
 }
 
+#[cfg(test)]
 fn context_window(history: &[Message], max_turns: usize) -> Vec<Message> {
     let system = history
         .first()
@@ -1049,10 +1045,6 @@ fn compact_tool_message(message: &Message) -> Message {
         })
         .unwrap_or_else(|| "{\"success\":true,\"result\":\"completed\"}".to_owned());
     Message::tool(message.tool_call_id.clone().unwrap_or_default(), summary)
-}
-
-fn prune_history(history: &mut Vec<Message>, max_turns: usize) {
-    *history = context_window(history, max_turns);
 }
 
 fn normalize_and_dedupe_short_response(answer: &str) -> String {
@@ -1413,12 +1405,9 @@ mod tests {
     }
 
     #[test]
-    fn current_data_without_source_is_guarded_locally() {
-        assert_eq!(
-            guarded_local_answer("Що по новинах?"),
-            Some("Актуального джерела новин у мене поки немає, сер. Не стану вигадувати.")
-        );
-        assert!(guarded_local_answer("Новини").is_some());
+    fn current_data_is_left_for_the_live_router() {
+        assert!(guarded_local_answer("Що по новинах?").is_none());
+        assert!(guarded_local_answer("Новини").is_none());
         assert!(guarded_local_answer("Історія новин України").is_none());
         assert!(guarded_local_answer("Розкажи історію газет").is_none());
     }
@@ -1446,6 +1435,9 @@ mod tests {
     fn uncertain_imperative_never_reaches_tool_calling() {
         assert!(looks_like_uncertain_computer_command("відкрес тим"));
         assert!(!looks_like_uncertain_computer_command("розкажи про Steam"));
+        assert!(!looks_like_uncertain_computer_command(
+            "відкрий браузер і знайди документацію Rust"
+        ));
     }
 
     #[test]
@@ -1495,6 +1487,14 @@ mod tests {
         );
         assert_eq!(
             match_local_control("Засни"),
+            Some(LocalControl::SleepAssistant)
+        );
+        assert_eq!(
+            match_local_control("Заснею"),
+            Some(LocalControl::SleepAssistant)
+        );
+        assert_eq!(
+            match_local_control("Заснив"),
             Some(LocalControl::SleepAssistant)
         );
         assert_eq!(
