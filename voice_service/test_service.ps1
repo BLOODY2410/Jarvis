@@ -1,9 +1,13 @@
-param(
+﻿param(
     [switch]$Play,
     [string]$BaseUrl = 'http://127.0.0.1:8765'
 )
 
 $ErrorActionPreference = 'Stop'
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $utf8
+[Console]::OutputEncoding = $utf8
+$OutputEncoding = $utf8
 $health = Invoke-RestMethod -Uri "$BaseUrl/health"
 $health | ConvertTo-Json -Depth 4
 

@@ -4,6 +4,7 @@ use std::{
     fs::{self, OpenOptions},
     io,
     io::Write,
+    process::Command,
     sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -58,6 +59,8 @@ const SYSTEM_PROMPT: &str = r#"Ти JARVIS — персональний AI-ас�
 Немає live-джерела: «Актуального джерела новин у мене поки немає, сер. Не стану вигадувати.»
 Невдала дія: «Не вдалося відкрити програму, сер. Windows її не знайшла.»
 Рідкісна суха іронія: «Не цілком, сер. Але, підозрюю, це вас не зупинить.»"#;
+const NORMAL_SHUTDOWN_MESSAGE: &str = "До зустрічі, сер.";
+const EMERGENCY_SHUTDOWN_MESSAGE: &str = "Прослуховування аварійно припинено.";
 
 pub struct Agent {
     groq: GroqClient,
@@ -67,6 +70,7 @@ pub struct Agent {
     voice: Option<VoiceClient>,
     voice_input: Option<VoiceInputClient>,
     conversation_timeout: Duration,
+    max_context_turns: usize,
 }
 
 enum PlaybackOutcome {
@@ -83,6 +87,23 @@ enum VoiceState {
     Transcribing,
     Executing,
     Speaking,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerAction {
+    Shutdown,
+    Restart,
+    Sleep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalControl {
+    EndSession,
+    SleepAssistant,
+    ShutdownAssistant,
+    RequestPower(PowerAction),
+    Confirm,
+    Cancel,
 }
 
 fn listening_deadline(state: VoiceState, now: Instant, timeout: Duration) -> Option<Instant> {
@@ -115,6 +136,7 @@ impl Agent {
         voice_input: Option<VoiceInputClient>,
         max_tool_rounds: usize,
         conversation_timeout_secs: u64,
+        max_context_turns: usize,
     ) -> Self {
         Self {
             groq,
@@ -124,6 +146,7 @@ impl Agent {
             voice,
             voice_input,
             conversation_timeout: Duration::from_secs(conversation_timeout_secs),
+            max_context_turns,
         }
     }
 
@@ -170,7 +193,7 @@ impl Agent {
                         eprintln!("[Voice Core] {error}");
                     }
                 }
-                Err(error) => eprintln!("\nJARVIS: Сталася помилка: {error}\n"),
+                Err(error) => eprintln!("\nJARVIS: {error}\n"),
             }
         }
 
@@ -184,6 +207,7 @@ impl Agent {
         input.set_state(false, false).await?;
         let mut voice_state = VoiceState::Idle;
         let mut conversation_deadline: Option<Instant> = None;
+        let mut pending_power: Option<PowerAction> = None;
 
         loop {
             let wait = conversation_deadline
@@ -216,7 +240,7 @@ impl Agent {
                 },
                 _ = tokio::signal::ctrl_c() => {
                     let _ = input.set_state(false, false).await;
-                    println!("\nJARVIS: Прослуховування аварійно припинено.");
+                    println!("\nJARVIS: {EMERGENCY_SHUTDOWN_MESSAGE}");
                     break;
                 }
             };
@@ -305,6 +329,100 @@ impl Agent {
                         continue;
                     }
                     println!("Ви: {text}");
+                    if let Some(control) = match_local_control(&text) {
+                        input.set_state(false, true).await?;
+                        let (answer, idle_after, shutdown_core) = match control {
+                            LocalControl::EndSession => {
+                                pending_power = None;
+                                (NORMAL_SHUTDOWN_MESSAGE.to_owned(), true, false)
+                            }
+                            LocalControl::SleepAssistant => {
+                                pending_power = None;
+                                ("Зрозумів, сер.".to_owned(), true, false)
+                            }
+                            LocalControl::ShutdownAssistant => {
+                                pending_power = None;
+                                (NORMAL_SHUTDOWN_MESSAGE.to_owned(), true, true)
+                            }
+                            LocalControl::RequestPower(action) => {
+                                pending_power = Some(action);
+                                (power_confirmation_prompt(action).to_owned(), false, false)
+                            }
+                            LocalControl::Confirm => match pending_power.take() {
+                                Some(action) => match execute_power_action(action) {
+                                    Ok(answer) => (answer, false, false),
+                                    Err(error) => (error, false, false),
+                                },
+                                None => {
+                                    ("Немає дії для підтвердження, сер.".to_owned(), false, false)
+                                }
+                            },
+                            LocalControl::Cancel => {
+                                pending_power = None;
+                                ("Скасовано.".to_owned(), false, false)
+                            }
+                        };
+                        println!("\nJARVIS: {answer}\n");
+                        if let Some(voice) = &self.voice
+                            && let Err(error) = voice.speak(&answer).await
+                        {
+                            eprintln!("[Voice Core] {error}");
+                        }
+                        if shutdown_core {
+                            let _ = input.set_state(false, false).await;
+                            break;
+                        }
+                        if idle_after {
+                            input.set_state(false, false).await?;
+                            transition(
+                                &mut voice_state,
+                                &mut conversation_deadline,
+                                VoiceState::Idle,
+                                "local_session_control",
+                                self.conversation_timeout,
+                            );
+                        } else {
+                            input.set_state(true, false).await?;
+                            transition(
+                                &mut voice_state,
+                                &mut conversation_deadline,
+                                VoiceState::Listening,
+                                "local_control_complete",
+                                self.conversation_timeout,
+                            );
+                        }
+                        continue;
+                    }
+                    if let Some(answer) = guarded_local_answer(&text) {
+                        input.set_state(true, true).await?;
+                        println!("[Local Router] matched=true");
+                        println!("\nJARVIS: {answer}\n");
+                        if let Some(voice) = self.voice.clone() {
+                            transition(
+                                &mut voice_state,
+                                &mut conversation_deadline,
+                                VoiceState::Speaking,
+                                "local_reply",
+                                self.conversation_timeout,
+                            );
+                            if matches!(
+                                self.speak_with_barge_in(&input, &voice, answer).await,
+                                PlaybackOutcome::Stopped
+                            ) {
+                                return self.run_text().await;
+                            }
+                        } else {
+                            input.set_state(true, false).await?;
+                        }
+                        transition(
+                            &mut voice_state,
+                            &mut conversation_deadline,
+                            VoiceState::Listening,
+                            "local_reply_complete",
+                            self.conversation_timeout,
+                        );
+                        continue;
+                    }
                     if let Some(command) = match_fast_command(&text) {
                         let intent_at = unix_ms();
                         let tool_start = unix_ms();
@@ -327,8 +445,6 @@ impl Agent {
                         let result = tool_task.await.map_err(io::Error::other)?;
                         let tool_done = unix_ms();
                         let answer = fast_answer(command.intent, &result, command.acknowledgement);
-                        self.history.push(Message::user(&text));
-                        self.history.push(Message::assistant(&answer));
                         println!(
                             "[Fast Path] intent={} args={}",
                             command.intent, command.arguments
@@ -404,6 +520,25 @@ impl Agent {
                         }
                         continue;
                     }
+                    if looks_like_uncertain_computer_command(&text) {
+                        let answer = "Не розібрав команду, сер. Повторіть.";
+                        input.set_state(true, true).await?;
+                        println!("[Safety Guard] uncertain_command=true tool_action=false");
+                        println!("\nJARVIS: {answer}\n");
+                        if let Some(voice) = self.voice.clone() {
+                            let _ = self.speak_with_barge_in(&input, &voice, answer).await;
+                        } else {
+                            input.set_state(true, false).await?;
+                        }
+                        transition(
+                            &mut voice_state,
+                            &mut conversation_deadline,
+                            VoiceState::Listening,
+                            "uncertain_command_rejected",
+                            self.conversation_timeout,
+                        );
+                        continue;
+                    }
                     // LLM fallback keeps the microphone closed while the agent
                     // thinks and performs tools, not only during audible TTS.
                     input.set_state(true, true).await?;
@@ -453,9 +588,7 @@ impl Agent {
                                                     return self.run_text().await;
                                                 }
                                             }
-                                            Err(error) => {
-                                                eprintln!("JARVIS: Сталася помилка: {error}")
-                                            }
+                                            Err(error) => eprintln!("JARVIS: {error}"),
                                         }
                                     }
                                     PlaybackOutcome::Stopped => {
@@ -486,7 +619,13 @@ impl Agent {
                             }
                         }
                         Err(error) => {
-                            eprintln!("\nJARVIS: Сталася помилка: {error}\n");
+                            let answer = error.to_string();
+                            eprintln!("\nJARVIS: {answer}\n");
+                            if let Some(voice) = &self.voice
+                                && let Err(tts_error) = voice.speak(&answer).await
+                            {
+                                eprintln!("[Voice Core] {tts_error}");
+                            }
                             input.set_state(true, false).await?;
                             transition(
                                 &mut voice_state,
@@ -584,14 +723,16 @@ impl Agent {
         voice_mode: bool,
     ) -> Result<String, Box<dyn Error>> {
         if let Some(answer) = guarded_local_answer(input) {
-            self.history.push(Message::user(input));
-            self.history.push(Message::assistant(answer));
             return Ok(answer.to_owned());
+        }
+        if looks_like_uncertain_computer_command(input) {
+            return Ok("Не розібрав команду, сер. Повторіть.".to_owned());
         }
         self.history.push(Message::user(input));
 
         for _ in 0..self.max_tool_rounds {
-            let mut message = self.groq.chat(&self.history, &self.tools).await?;
+            let context = context_window(&self.history, self.max_context_turns);
+            let mut message = self.groq.chat(&context, &self.tools).await?;
             let tool_calls = message.tool_calls.clone().unwrap_or_default();
             let content = message.content.clone();
 
@@ -603,6 +744,7 @@ impl Agent {
                 );
                 message.content = Some(answer.clone());
                 self.history.push(message);
+                prune_history(&mut self.history, self.max_context_turns);
                 return Ok(answer);
             }
             self.history.push(message);
@@ -630,6 +772,66 @@ impl Agent {
     }
 }
 
+fn match_local_control(input: &str) -> Option<LocalControl> {
+    let text = normalize_for_guard(input);
+    match text.as_str() {
+        "завершити розмову" | "закінчити розмову" | "досить" | "на цьому все" => {
+            Some(LocalControl::EndSession)
+        }
+        "іди в sleep mode" | "засни" | "сплячий режим" => {
+            Some(LocalControl::SleepAssistant)
+        }
+        "вимкнись" | "заверши роботу" | "вимкни jarvis" | "вимкни джарвіс" => {
+            Some(LocalControl::ShutdownAssistant)
+        }
+        "вимкни комп ютер" | "вимкни комп'ютер" | "вимкни компьютер" => {
+            Some(LocalControl::RequestPower(PowerAction::Shutdown))
+        }
+        "перезавантаж комп ютер" | "перезавантаж комп'ютер" | "перезавантаж компьютер" => {
+            Some(LocalControl::RequestPower(PowerAction::Restart))
+        }
+        "приспи комп ютер" | "приспи комп'ютер" | "приспи компьютер" => {
+            Some(LocalControl::RequestPower(PowerAction::Sleep))
+        }
+        "так підтверджую" | "підтверджую" | "так виконуй" => {
+            Some(LocalControl::Confirm)
+        }
+        "скасуй" | "ні скасуй" | "відміна" => Some(LocalControl::Cancel),
+        _ => None,
+    }
+}
+
+fn power_confirmation_prompt(action: PowerAction) -> &'static str {
+    match action {
+        PowerAction::Shutdown => "Підтвердьте вимкнення комп'ютера словами «Так, підтверджую».",
+        PowerAction::Restart => {
+            "Підтвердьте перезавантаження комп'ютера словами «Так, підтверджую»."
+        }
+        PowerAction::Sleep => "Підтвердьте присипання комп'ютера словами «Так, підтверджую».",
+    }
+}
+
+fn execute_power_action(action: PowerAction) -> Result<String, String> {
+    let (program, arguments, answer): (&str, &[&str], &str) = match action {
+        PowerAction::Shutdown => ("shutdown.exe", &["/s", "/t", "0"], "Вимикаю комп'ютер."),
+        PowerAction::Restart => (
+            "shutdown.exe",
+            &["/r", "/t", "0"],
+            "Перезавантажую комп'ютер.",
+        ),
+        PowerAction::Sleep => (
+            "rundll32.exe",
+            &["powrprof.dll,SetSuspendState", "0,1,0"],
+            "Переводжу комп'ютер у сплячий режим.",
+        ),
+    };
+    Command::new(program)
+        .args(arguments)
+        .spawn()
+        .map(|_| answer.to_owned())
+        .map_err(|_| "Не вдалося виконати команду живлення, сер.".to_owned())
+}
+
 fn guarded_local_answer(input: &str) -> Option<&'static str> {
     let text = normalize_for_guard(input);
     if matches!(
@@ -639,10 +841,21 @@ fn guarded_local_answer(input: &str) -> Option<&'static str> {
         return Some("Вітаю, сер.");
     }
     if text.contains("як себе")
+        || text == "як справи"
+        || text == "як ти"
         || text.contains("як почуваєшся")
         || text.contains("як ти почуваєшся")
     {
         return Some("Усі системи працюють штатно, сер.");
+    }
+    if matches!(text.as_str(), "дякую" | "спасибі") {
+        return Some("Будь ласка, сер.");
+    }
+    if matches!(text.as_str(), "ау" | "ти тут" | "джарвіс" | "джарвис") {
+        return Some("Я тут, сер.");
+    }
+    if matches!(text.as_str(), "ок" | "окей" | "добре" | "ясно") {
+        return Some("Зрозумів.");
     }
 
     let asks_now = [
@@ -728,6 +941,7 @@ fn normalize_for_guard(input: &str) -> String {
 fn finalize_assistant_response(input: &str, answer: &str, voice_mode: bool) -> String {
     let answer = replace_legacy_address(answer);
     let answer = remove_generic_outro(&answer);
+    let answer = normalize_and_dedupe_short_response(&answer);
     let answer = if is_echo_response(input, &answer) {
         "Потрібне коротке уточнення, сер.".to_owned()
     } else {
@@ -738,6 +952,193 @@ fn finalize_assistant_response(input: &str, answer: &str, voice_mode: bool) -> S
     } else {
         answer
     }
+}
+
+fn looks_like_uncertain_computer_command(input: &str) -> bool {
+    let text = normalize_for_guard(input);
+    let first = text.split_whitespace().next().unwrap_or_default();
+    let commandish = [
+        "відкрий",
+        "відкри",
+        "відкрес",
+        "відкрей",
+        "відкрай",
+        "запусти",
+        "включи",
+        "увімкни",
+        "закрий",
+        "зупини",
+        "вимкни",
+        "постав",
+        "перемкни",
+        "натисни",
+        "повернися",
+    ];
+    commandish
+        .iter()
+        .any(|verb| bounded_distance(first, verb, 2) <= 2)
+}
+
+fn bounded_distance(left: &str, right: &str, limit: usize) -> usize {
+    if left.chars().count().abs_diff(right.chars().count()) > limit {
+        return limit + 1;
+    }
+    let right: Vec<_> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (row, a) in left.chars().enumerate() {
+        let mut current = vec![row + 1];
+        for (column, b) in right.iter().enumerate() {
+            current.push(
+                (current[column] + 1)
+                    .min(previous[column + 1] + 1)
+                    .min(previous[column] + usize::from(a != *b)),
+            );
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+fn context_window(history: &[Message], max_turns: usize) -> Vec<Message> {
+    let system = history
+        .first()
+        .filter(|message| message.role == "system")
+        .cloned();
+    let user_indices: Vec<_> = history
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| (message.role == "user").then_some(index))
+        .collect();
+    let start = user_indices
+        .get(user_indices.len().saturating_sub(max_turns))
+        .copied()
+        .unwrap_or(1);
+    let latest_user = history
+        .iter()
+        .rposition(|message| message.role == "user")
+        .unwrap_or(history.len());
+    system
+        .into_iter()
+        .chain(
+            history[start..]
+                .iter()
+                .enumerate()
+                .map(|(offset, message)| {
+                    let absolute = start + offset;
+                    if message.role == "tool" && absolute < latest_user {
+                        compact_tool_message(message)
+                    } else {
+                        message.clone()
+                    }
+                }),
+        )
+        .collect()
+}
+
+fn compact_tool_message(message: &Message) -> Message {
+    let summary = message
+        .content
+        .as_deref()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+        .map(|payload| {
+            if payload.get("success").and_then(serde_json::Value::as_bool) == Some(true) {
+                "{\"success\":true,\"result\":\"completed\"}".to_owned()
+            } else {
+                "{\"success\":false,\"error\":\"failed\"}".to_owned()
+            }
+        })
+        .unwrap_or_else(|| "{\"success\":true,\"result\":\"completed\"}".to_owned());
+    Message::tool(message.tool_call_id.clone().unwrap_or_default(), summary)
+}
+
+fn prune_history(history: &mut Vec<Message>, max_turns: usize) {
+    *history = context_window(history, max_turns);
+}
+
+fn normalize_and_dedupe_short_response(answer: &str) -> String {
+    let mut spaced = String::with_capacity(answer.len() + 4);
+    let chars: Vec<_> = answer.chars().collect();
+    for (index, character) in chars.iter().enumerate() {
+        spaced.push(*character);
+        if matches!(character, '.' | '!' | '?')
+            && chars
+                .get(index + 1)
+                .is_some_and(|next| !next.is_whitespace())
+        {
+            spaced.push(' ');
+        }
+    }
+    let mut units = Vec::new();
+    let mut start = 0;
+    for (index, character) in spaced.char_indices() {
+        if matches!(character, '.' | '!' | '?') {
+            let unit = spaced[start..=index].trim();
+            if !unit.is_empty()
+                && units.last().is_none_or(|previous: &&str| {
+                    normalize_for_guard(previous) != normalize_for_guard(unit)
+                })
+            {
+                units.push(unit);
+            }
+            start = index + character.len_utf8();
+        }
+    }
+    let tail = spaced[start..].trim();
+    if !tail.is_empty() {
+        units.push(tail);
+    }
+    let mut result = units.join(" ");
+    if result.split_whitespace().count() <= 45 {
+        result = keep_one_address(&result);
+    }
+    result
+}
+
+fn keep_one_address(answer: &str) -> String {
+    let mut result = answer.to_owned();
+    let mut seen = false;
+    let mut search_from = 0;
+    loop {
+        let lower = result.to_lowercase();
+        let Some(relative) = lower[search_from..].find("сер") else {
+            break;
+        };
+        let start = search_from + relative;
+        let end = start + "сер".len();
+        let before_ok = start == 0
+            || !lower[..start]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric);
+        let after_ok = end == lower.len()
+            || !lower[end..]
+                .chars()
+                .next()
+                .is_some_and(char::is_alphanumeric);
+        if !before_ok || !after_ok {
+            search_from = end;
+            continue;
+        }
+        if !seen {
+            seen = true;
+            search_from = end;
+            continue;
+        }
+        let mut remove_start = start;
+        while remove_start > 0 && result[..remove_start].ends_with(' ') {
+            remove_start -= 1;
+        }
+        if remove_start > 0 && result[..remove_start].ends_with(',') {
+            remove_start -= 1;
+        }
+        result.replace_range(remove_start..end, "");
+        search_from = remove_start;
+    }
+    result
+        .replace(" ,", ",")
+        .replace("  ", " ")
+        .trim()
+        .to_owned()
 }
 
 fn replace_legacy_address(answer: &str) -> String {
@@ -977,10 +1378,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        SYSTEM_PROMPT, VoiceState, clean_wake_word, fast_answer, finalize_assistant_response,
-        guarded_local_answer, listening_deadline, transition,
+        EMERGENCY_SHUTDOWN_MESSAGE, LocalControl, NORMAL_SHUTDOWN_MESSAGE, PowerAction,
+        SYSTEM_PROMPT, VoiceState, clean_wake_word, context_window, fast_answer,
+        finalize_assistant_response, guarded_local_answer, listening_deadline,
+        looks_like_uncertain_computer_command, match_local_control, transition,
     };
     use crate::core::fast_command::match_fast_command;
+    use crate::core::messages::Message;
 
     #[test]
     fn strips_supported_wake_words() {
@@ -1004,7 +1408,7 @@ mod tests {
             fast_answer(command.intent, tool_result, command.acknowledgement),
             command.acknowledgement
         );
-        assert_eq!(command.acknowledgement, "Відкрито.");
+        assert_eq!(command.acknowledgement, "YouTube відкрито.");
         assert_eq!(command.acknowledgement_cache, Some("opened"));
     }
 
@@ -1025,6 +1429,98 @@ mod tests {
             guarded_local_answer("Як себе чувствуєш?"),
             Some("Усі системи працюють штатно, сер.")
         );
+    }
+
+    #[test]
+    fn trivial_small_talk_is_local() {
+        assert_eq!(guarded_local_answer("Дякую."), Some("Будь ласка, сер."));
+        assert_eq!(
+            guarded_local_answer("Як справи?"),
+            Some("Усі системи працюють штатно, сер.")
+        );
+        assert_eq!(guarded_local_answer("Ти тут?"), Some("Я тут, сер."));
+        assert_eq!(guarded_local_answer("Ок"), Some("Зрозумів."));
+    }
+
+    #[test]
+    fn uncertain_imperative_never_reaches_tool_calling() {
+        assert!(looks_like_uncertain_computer_command("відкрес тим"));
+        assert!(!looks_like_uncertain_computer_command("розкажи про Steam"));
+    }
+
+    #[test]
+    fn adjacent_duplicate_sentences_and_addresses_are_removed() {
+        assert_eq!(
+            finalize_assistant_response("Відкрий Steam", "Steam відкрито.Steam відкрито.", false),
+            "Steam відкрито."
+        );
+        let answer =
+            finalize_assistant_response("Як справи?", "Вітаю, сер. У мене все гаразд, сер.", false);
+        assert_eq!(answer.matches("сер").count(), 1);
+    }
+
+    #[test]
+    fn context_keeps_system_and_only_recent_turns() {
+        let mut history = vec![Message::system("system")];
+        for number in 0..10 {
+            history.push(Message::user(format!("user-{number}")));
+            history.push(Message::assistant(format!("assistant-{number}")));
+        }
+        let context = context_window(&history, 4);
+        assert_eq!(context.first().unwrap().role, "system");
+        assert_eq!(
+            context
+                .iter()
+                .filter(|message| message.role == "user")
+                .count(),
+            4
+        );
+        assert!(
+            context
+                .iter()
+                .any(|message| message.content.as_deref() == Some("user-9"))
+        );
+        assert!(
+            !context
+                .iter()
+                .any(|message| message.content.as_deref() == Some("user-0"))
+        );
+    }
+
+    #[test]
+    fn assistant_controls_are_distinct_from_power_controls() {
+        assert_eq!(
+            match_local_control("Завершити розмову"),
+            Some(LocalControl::EndSession)
+        );
+        assert_eq!(
+            match_local_control("Засни"),
+            Some(LocalControl::SleepAssistant)
+        );
+        assert_eq!(
+            match_local_control("Вимкнись"),
+            Some(LocalControl::ShutdownAssistant)
+        );
+        assert_eq!(
+            match_local_control("Вимкни комп'ютер"),
+            Some(LocalControl::RequestPower(PowerAction::Shutdown))
+        );
+        assert_ne!(NORMAL_SHUTDOWN_MESSAGE, EMERGENCY_SHUTDOWN_MESSAGE);
+        assert!(!NORMAL_SHUTDOWN_MESSAGE.contains("аварійно"));
+    }
+
+    #[test]
+    fn powershell_launchers_explicitly_use_utf8_without_mojibake_literal() {
+        for script in [
+            include_str!("../../start.ps1"),
+            include_str!("../../status.ps1"),
+            include_str!("../../stop.ps1"),
+            include_str!("../../test.ps1"),
+            include_str!("../../test-and-start.ps1"),
+        ] {
+            assert!(script.contains("[Console]::OutputEncoding = $utf8"));
+            assert!(!script.contains("Р”Р¶"));
+        }
     }
 
     #[test]

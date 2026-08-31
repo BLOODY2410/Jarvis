@@ -9,9 +9,65 @@ pub struct FastCommand {
 }
 
 pub fn match_fast_command(input: &str) -> Option<FastCommand> {
-    let text = normalize(input);
+    let text = expand_known_merged_command(&normalize(input));
     if text.is_empty() || contains_complexity_marker(&text) {
         return None;
+    }
+
+    if matches_any(
+        &text,
+        &[
+            "відкрий youtube music",
+            "відкрий ютуб music",
+            "відкрий ютуб музику",
+        ],
+    ) {
+        return command(
+            "open_youtube_music",
+            json!({}),
+            "YouTube Music відкрито.",
+            None,
+        );
+    }
+    if matches_any(
+        &text,
+        &[
+            "включи музику в youtube music",
+            "увімкни музику в youtube music",
+            "включи якусь музику в youtube music",
+            "увімкни якусь музику в youtube music",
+            "включи музику в ютуб music",
+        ],
+    ) {
+        return command(
+            "play_youtube_music",
+            json!({}),
+            "Музику запущено в YouTube Music.",
+            None,
+        );
+    }
+    if matches_any(&text, &["постав на паузу", "пауза", "призупини музику"])
+    {
+        return command("pause_media", json!({}), "Відтворення призупинено.", None);
+    }
+    if matches_any(
+        &text,
+        &["продовж музику", "продовж відтворення", "зніми з паузи"],
+    ) {
+        return command("resume_media", json!({}), "Відтворення продовжено.", None);
+    }
+    if matches_any(&text, &["наступний трек", "увімкни наступний трек"])
+    {
+        return command("next_track", json!({}), "Увімкнено наступний трек.", None);
+    }
+    if matches_any(&text, &["попередній трек", "увімкни попередній трек"])
+    {
+        return command(
+            "previous_track",
+            json!({}),
+            "Увімкнено попередній трек.",
+            None,
+        );
     }
 
     if matches_any(
@@ -101,8 +157,21 @@ pub fn match_fast_command(input: &str) -> Option<FastCommand> {
         &text,
         &["відкрий", "відкрити", "запусти", "запустити", "включи"],
     ) {
+        if let Some(app) = known_app_alias(target) {
+            return command(
+                "open_app",
+                json!({"app": app}),
+                app_opened_ack(app),
+                Some("opened"),
+            );
+        }
         if let Some(url) = website_url(target) {
-            return command("open_url", json!({"url": url}), "Відкрито.", Some("opened"));
+            return command(
+                "open_url",
+                json!({"url": url}),
+                website_opened_ack(url),
+                Some("opened"),
+            );
         }
         if let Some(domain) = target
             .strip_prefix("сайт ")
@@ -111,12 +180,22 @@ pub fn match_fast_command(input: &str) -> Option<FastCommand> {
             let url = normalize_url(domain)?;
             return command("open_url", json!({"url": url}), "Відкрито.", Some("opened"));
         }
-        if target.contains('.') && !target.contains(' ') {
+        if is_valid_domain(target) {
             let url = normalize_url(target)?;
-            return command("open_url", json!({"url": url}), "Відкрито.", Some("opened"));
+            return command(
+                "open_url",
+                json!({"url": url}),
+                "Сайт відкрито.",
+                Some("opened"),
+            );
         }
         let app = app_alias(target)?;
-        return command("open_app", json!({"app": app}), "Відкрито.", Some("opened"));
+        return command(
+            "open_app",
+            json!({"app": app}),
+            app_opened_ack(app),
+            Some("opened"),
+        );
     }
 
     // Colloquial "давай Steam/Chrome" is safe only when the target resolves to
@@ -163,7 +242,11 @@ fn command(
 }
 
 fn normalize(input: &str) -> String {
-    let lower = input.to_lowercase().replace(['’', '`'], "'");
+    let lower = input
+        .trim()
+        .trim_end_matches(['.', ',', '!', '?', ':', ';'])
+        .to_lowercase()
+        .replace(['’', '`'], "'");
     let cleaned: String = lower
         .chars()
         .map(|character| {
@@ -191,6 +274,47 @@ fn normalize(input: &str) -> String {
         .filter(|word| !fillers.contains(word))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn expand_known_merged_command(text: &str) -> String {
+    const VERBS: &[(&str, &str)] = &[
+        ("відкрий", "відкрий"),
+        ("відкри", "відкрий"),
+        ("відкрі", "відкрий"),
+        ("запусти", "запусти"),
+        ("включи", "включи"),
+    ];
+    const TARGETS: &[(&str, &str)] = &[
+        ("стім", "стім"),
+        ("steam", "steam"),
+        ("ютуб", "ютуб"),
+        ("youtube", "youtube"),
+        ("хром", "хром"),
+        ("chrome", "chrome"),
+        ("дискорд", "дискорд"),
+        ("discord", "discord"),
+        ("телеграм", "телеграм"),
+        ("telegram", "telegram"),
+        ("vscode", "vscode"),
+        ("віескод", "vscode"),
+        ("visualstudiocode", "visual studio code"),
+        ("візуалстудіокод", "visual studio code"),
+        ("калькулятор", "калькулятор"),
+        ("calculator", "calculator"),
+        ("блокнот", "блокнот"),
+        ("notepad", "notepad"),
+    ];
+    if text.contains(' ') {
+        return text.to_owned();
+    }
+    for (prefix, verb) in VERBS {
+        if let Some(target) = text.strip_prefix(prefix)
+            && let Some((_, expanded)) = TARGETS.iter().find(|(alias, _)| *alias == target)
+        {
+            return format!("{verb} {expanded}");
+        }
+    }
+    text.to_owned()
 }
 
 fn contains_complexity_marker(text: &str) -> bool {
@@ -308,6 +432,49 @@ fn normalize_url(target: &str) -> Option<String> {
             format!("https://{target}")
         },
     )
+}
+
+fn is_valid_domain(target: &str) -> bool {
+    let without_scheme = target
+        .strip_prefix("https://")
+        .or_else(|| target.strip_prefix("http://"))
+        .unwrap_or(target);
+    let host = without_scheme.split(['/', ':']).next().unwrap_or_default();
+    if host.is_empty() || host.ends_with('.') || host.contains(char::is_whitespace) {
+        return false;
+    }
+    let mut labels = host.split('.');
+    let first = labels.next().unwrap_or_default();
+    let rest: Vec<_> = labels.collect();
+    let tld = rest.last().copied().unwrap_or_default();
+    !first.is_empty()
+        && !rest.is_empty()
+        && tld.len() >= 2
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+        && tld.chars().all(|c| c.is_ascii_alphabetic())
+}
+
+fn app_opened_ack(app: &str) -> &'static str {
+    match app {
+        "steam" => "Steam відкрито.",
+        "discord" => "Discord відкрито.",
+        "telegram" => "Telegram відкрито.",
+        "chrome" => "Chrome відкрито.",
+        "visual studio code" => "Visual Studio Code відкрито.",
+        "калькулятор" => "Калькулятор відкрито.",
+        "блокнот" => "Блокнот відкрито.",
+        _ => "Програму відкрито.",
+    }
+}
+
+fn website_opened_ack(url: &str) -> &'static str {
+    if url.contains("youtube.com") {
+        "YouTube відкрито."
+    } else {
+        "Сайт відкрито."
+    }
 }
 
 fn app_alias(target: &str) -> Option<&str> {
@@ -495,6 +662,29 @@ mod tests {
         assert_eq!(intent("відкрий дискорд"), Some("open_app"));
         assert_eq!(intent("зокрий блокнот"), None);
         assert_eq!(intent("відкрий браузер і знайди погоду"), None);
+    }
+
+    #[test]
+    fn trailing_punctuation_does_not_turn_apps_into_domains() {
+        let steam = match_fast_command("Відкрий, Steam.").unwrap();
+        assert_eq!(steam.intent, "open_app");
+        assert!(steam.arguments.contains(r#""app":"steam""#));
+        let domain = match_fast_command("Відкрий youtube.com.").unwrap();
+        assert_eq!(domain.intent, "open_url");
+        assert!(domain.arguments.contains("https://youtube.com"));
+        for app in ["steam.", "discord.", "chrome."] {
+            assert_eq!(intent(&format!("відкрий {app}")), Some("open_app"));
+        }
+    }
+
+    #[test]
+    fn splits_only_whitelisted_merged_commands() {
+        assert_eq!(intent("відкрістім"), Some("open_app"));
+        assert_eq!(intent("відкрийютуб"), Some("open_url"));
+        assert_eq!(intent("запустидискорд"), Some("open_app"));
+        assert_eq!(intent("відкрийвізуалстудіокод"), Some("open_app"));
+        assert_eq!(intent("відкрийбанкінг"), None);
+        assert_eq!(intent("видалифайл"), None);
     }
 
     #[test]

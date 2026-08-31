@@ -1,5 +1,9 @@
-param([switch]$Live)
+﻿param([switch]$Live)
 $ErrorActionPreference = 'Stop'
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $utf8
+[Console]::OutputEncoding = $utf8
+$OutputEncoding = $utf8
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $python = Join-Path $projectRoot '.venv\Scripts\python.exe'
 $cargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'

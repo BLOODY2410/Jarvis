@@ -1,5 +1,6 @@
 mod apps;
 mod browser;
+mod browser_control;
 mod files;
 mod screen;
 mod system;
@@ -47,6 +48,42 @@ impl ToolRegistry {
                         "url": {"type": "string", "description": "Повна вебадреса з https:// або http://."}
                     }),
                     &["url"],
+                ),
+                tool(
+                    "open_youtube_music",
+                    "Відкрити YouTube Music в окремому керованому профілі JARVIS.",
+                    json!({}),
+                    &[],
+                ),
+                tool(
+                    "play_youtube_music",
+                    "Знайти й фактично запустити музику в керованому YouTube Music.",
+                    json!({"query": {"type": "string", "description": "Необов'язковий пошуковий запит."}}),
+                    &[],
+                ),
+                tool(
+                    "pause_media",
+                    "Поставити медіа керованої сесії на паузу.",
+                    json!({}),
+                    &[],
+                ),
+                tool(
+                    "resume_media",
+                    "Продовжити медіа керованої сесії.",
+                    json!({}),
+                    &[],
+                ),
+                tool(
+                    "next_track",
+                    "Увімкнути наступний трек керованої сесії.",
+                    json!({}),
+                    &[],
+                ),
+                tool(
+                    "previous_track",
+                    "Увімкнути попередній трек керованої сесії.",
+                    json!({}),
+                    &[],
                 ),
                 tool(
                     "set_volume",
@@ -144,6 +181,14 @@ impl ToolRegistry {
             "close_app" => required_str(&args, "app").and_then(apps::close_app),
             "get_running_apps" => apps::get_running_apps(),
             "open_url" => required_str(&args, "url").and_then(browser::open_url),
+            "open_youtube_music" => browser_control::open_youtube_music(),
+            "play_youtube_music" => {
+                browser_control::play_youtube_music(optional_str(&args, "query"))
+            }
+            "pause_media" => browser_control::media_control("pause"),
+            "resume_media" => browser_control::media_control("resume"),
+            "next_track" => browser_control::media_control("next"),
+            "previous_track" => browser_control::media_control("previous"),
             "set_volume" => required_u64(&args, "level")
                 .and_then(|level| system::set_volume(level.min(100) as u8)),
             "mute" => system::set_muted(true),
@@ -286,7 +331,7 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), original_len);
-        assert_eq!(original_len, 15);
+        assert_eq!(original_len, 21);
     }
 
     #[test]

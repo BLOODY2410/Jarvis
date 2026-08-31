@@ -1,4 +1,8 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $utf8
+[Console]::OutputEncoding = $utf8
+$OutputEncoding = $utf8
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $python = Join-Path $projectRoot '.venv\Scripts\python.exe'
 $cargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
@@ -110,7 +114,7 @@ try {
     Start-LocalService 'voice-service' (Join-Path $projectRoot 'voice_service') 8765
     Test-TtsSynthesis
     Start-LocalService 'voice-input' (Join-Path $projectRoot 'voice_input_service') 8766
-    Write-Host 'JARVIS ready. Say "Джарвіс" or press Ctrl+Alt+J, wait for the short cue, then speak.'
+    Write-Host 'JARVIS ready. Say the wake word or press Ctrl+Alt+J, wait for the short cue, then speak.'
     Set-Location -LiteralPath $projectRoot
     & $cargo run
 } finally {

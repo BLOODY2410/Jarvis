@@ -1,4 +1,5 @@
 /target
+.jarvis-browser-profile/
 .venv/
 logs/
 .env

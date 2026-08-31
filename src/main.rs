@@ -14,7 +14,12 @@ use crate::{
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = Config::from_env()?;
-    let groq = GroqClient::new(config.groq_api_key, config.groq_model);
+    let groq = GroqClient::new(
+        config.groq_api_key,
+        config.groq_model,
+        config.groq_max_retries,
+        config.groq_max_completion_tokens,
+    );
     let voice = config.tts_enabled.then(|| VoiceClient::new(config.tts_url));
     let voice_input = config
         .voice_input_enabled
@@ -25,6 +30,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         voice_input,
         config.max_tool_rounds,
         config.conversation_timeout_secs,
+        config.groq_max_context_turns,
     );
 
     agent.run().await

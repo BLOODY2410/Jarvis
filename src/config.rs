@@ -7,6 +7,9 @@ const DEFAULT_MAX_TOOL_ROUNDS: usize = 8;
 const DEFAULT_TTS_URL: &str = "http://127.0.0.1:8765";
 const DEFAULT_VOICE_INPUT_URL: &str = "http://127.0.0.1:8766";
 const DEFAULT_CONVERSATION_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_GROQ_MAX_CONTEXT_TURNS: usize = 6;
+const DEFAULT_GROQ_MAX_COMPLETION_TOKENS: u32 = 180;
+const DEFAULT_GROQ_MAX_RETRIES: usize = 1;
 
 pub struct Config {
     pub groq_api_key: String,
@@ -17,6 +20,9 @@ pub struct Config {
     pub voice_input_enabled: bool,
     pub voice_input_url: String,
     pub conversation_timeout_secs: u64,
+    pub groq_max_context_turns: usize,
+    pub groq_max_completion_tokens: u32,
+    pub groq_max_retries: usize,
 }
 
 impl Config {
@@ -48,6 +54,16 @@ impl Config {
             .and_then(|value| value.parse().ok())
             .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_CONVERSATION_TIMEOUT_SECS);
+        let groq_max_context_turns =
+            positive_env("GROQ_MAX_CONTEXT_TURNS").unwrap_or(DEFAULT_GROQ_MAX_CONTEXT_TURNS);
+        let groq_max_completion_tokens = positive_env("GROQ_MAX_COMPLETION_TOKENS")
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(DEFAULT_GROQ_MAX_COMPLETION_TOKENS);
+        let groq_max_retries = env::var("GROQ_MAX_RETRIES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .map(|value: usize| value.min(1))
+            .unwrap_or(DEFAULT_GROQ_MAX_RETRIES);
 
         Ok(Self {
             groq_api_key,
@@ -58,8 +74,18 @@ impl Config {
             voice_input_enabled,
             voice_input_url,
             conversation_timeout_secs,
+            groq_max_context_turns,
+            groq_max_completion_tokens,
+            groq_max_retries,
         })
     }
+}
+
+fn positive_env(name: &str) -> Option<usize> {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
 }
 
 fn env_bool(name: &str, default: bool) -> bool {

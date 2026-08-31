@@ -39,6 +39,7 @@ impl Message {
         Self::text("user", text)
     }
 
+    #[cfg(test)]
     pub fn assistant(text: impl Into<String>) -> Self {
         Self::text("assistant", text)
     }

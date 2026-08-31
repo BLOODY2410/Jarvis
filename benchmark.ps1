@@ -1,4 +1,8 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $utf8
+[Console]::OutputEncoding = $utf8
+$OutputEncoding = $utf8
 $path = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'logs\latency.jsonl'
 if (-not (Test-Path -LiteralPath $path)) { throw 'No latency samples yet. Run at least 20 voice commands first.' }
 $samples = @(Get-Content -LiteralPath $path | ForEach-Object { try { $_ | ConvertFrom-Json } catch {} } | Where-Object { $_.path -eq 'fast_path' } | Select-Object -ExpandProperty speech_end_to_tool_start_ms)
