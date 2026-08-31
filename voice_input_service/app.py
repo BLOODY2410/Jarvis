@@ -30,12 +30,15 @@ from pydantic import BaseModel
 
 SERVICE_ROOT = Path(__file__).resolve().parent
 load_dotenv(SERVICE_ROOT.parent / ".env")
-logging.basicConfig(level=os.getenv("JARVIS_INPUT_LOG_LEVEL", "INFO"))
+_default_log_level = "DEBUG" if os.getenv("JARVIS_PROFILE", "production").strip().lower() == "debug" else "WARNING"
+logging.basicConfig(level=os.getenv("JARVIS_INPUT_LOG_LEVEL", _default_log_level))
 LOGGER = logging.getLogger("jarvis.voice_input")
 
 SAMPLE_RATE = 16_000
-FRAME_MS = 80
+FRAME_MS = 20
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1_000
+WAKE_FRAME_MS = 80
+WAKE_FRAME_COUNT = WAKE_FRAME_MS // FRAME_MS
 VOSK_MODEL_NAME = "vosk-model-small-uk-v3-nano"
 VOSK_MODEL_URL = f"https://alphacephei.com/vosk/models/{VOSK_MODEL_NAME}.zip"
 
@@ -79,12 +82,13 @@ class Settings:
     min_audio_rms: float
     post_tts_guard_ms: int
     stt_prompt: str
+    profile: str = "production"
     diagnostic: bool = False
     level_log_interval_ms: int = 1_000
-    pre_roll_ms: int = 560
-    post_roll_ms: int = 480
+    pre_roll_ms: int = 480
+    post_roll_ms: int = 240
     diagnostic_dir: Path = SERVICE_ROOT / "diagnostics"
-    stt_response_format: str = "verbose_json"
+    stt_response_format: str = "json"
     wake_variants: tuple[str, ...] = ("джарвіс", "джарвис", "джарвиз")
     wake_vosk_max_edit_distance: int = 1
     vad_energy_ratio: float = 1.10
@@ -93,7 +97,7 @@ class Settings:
     activation_mode: str = "hotkey"
     hotkey_enabled: bool = True
     fast_whisper_model: str = "whisper-large-v3-turbo"
-    fast_silence_ms: int = 560
+    fast_silence_ms: int = 440
     long_utterance_threshold_ms: int = 3_000
     fast_stt_max_speech_ms: int = 3_500
     vad_resume_chunks: int = 2
@@ -104,6 +108,9 @@ class Settings:
         device: int | str | None = None
         if device_text:
             device = int(device_text) if device_text.isdigit() else device_text
+        profile = os.getenv("JARVIS_PROFILE", "production").strip().lower()
+        if profile not in {"production", "debug"}:
+            raise ValueError("JARVIS_PROFILE must be production or debug")
         return cls(
             groq_api_key=os.getenv("GROQ_API_KEY", "").strip(),
             whisper_model=os.getenv("JARVIS_WHISPER_MODEL", "whisper-large-v3"),
@@ -117,18 +124,19 @@ class Settings:
             barge_in_enabled=env_bool("JARVIS_BARGE_IN_ENABLED", False),
             min_speech_ms=max(0, int(env_float("JARVIS_MIN_SPEECH_MS", 300))),
             min_audio_rms=max(0.0, env_float("JARVIS_MIN_AUDIO_RMS", 0.0015)),
-            post_tts_guard_ms=max(0, int(env_float("JARVIS_POST_TTS_GUARD_MS", 800))),
+            post_tts_guard_ms=max(0, int(env_float("JARVIS_POST_TTS_GUARD_MS", 200))),
             stt_prompt=os.getenv(
                 "JARVIS_STT_PROMPT",
                 "Українська голосова команда для персонального асистента Джарвіс. "
                 "Можливі назви Windows, YouTube, Google, браузер, PowerShell, Steam та Discord.",
             ),
-            diagnostic=env_bool("JARVIS_DIAGNOSTIC", True),
+            profile=profile,
+            diagnostic=env_bool("JARVIS_DIAGNOSTIC", profile == "debug"),
             level_log_interval_ms=max(100, int(env_float("JARVIS_LEVEL_LOG_INTERVAL_MS", 1_000))),
-            pre_roll_ms=max(FRAME_MS, int(env_float("JARVIS_PRE_ROLL_MS", 560))),
-            post_roll_ms=max(0, int(env_float("JARVIS_POST_ROLL_MS", 480))),
+            pre_roll_ms=max(FRAME_MS, int(env_float("JARVIS_PRE_ROLL_MS", 480))),
+            post_roll_ms=max(0, int(env_float("JARVIS_POST_ROLL_MS", 240))),
             diagnostic_dir=Path(os.getenv("JARVIS_DIAGNOSTIC_DIR", str(SERVICE_ROOT / "diagnostics"))).resolve(),
-            stt_response_format=os.getenv("JARVIS_STT_RESPONSE_FORMAT", "verbose_json").strip() or "verbose_json",
+            stt_response_format=os.getenv("JARVIS_STT_RESPONSE_FORMAT", "json").strip() or "json",
             wake_variants=tuple(
                 item.strip()
                 for item in os.getenv("JARVIS_WAKE_VARIANTS", "джарвіс,джарвис,джарвиз").split(",")
@@ -147,7 +155,7 @@ class Settings:
                 "JARVIS_FAST_WHISPER_MODEL", "whisper-large-v3-turbo"
             ).strip() or "whisper-large-v3-turbo",
             fast_silence_ms=max(
-                400, min(600, int(env_float("JARVIS_FAST_END_SILENCE_MS", 560)))
+                400, min(600, int(env_float("JARVIS_FAST_END_SILENCE_MS", 440)))
             ),
             long_utterance_threshold_ms=max(
                 1_000, int(env_float("JARVIS_LONG_UTTERANCE_THRESHOLD_MS", 3_000))
@@ -178,6 +186,7 @@ class VoiceInputEngine:
         self._thread: threading.Thread | None = None
         self._conversation_active = False
         self._speaking = False
+        self._state = "IDLE"
         self._wake_model = None
         self._wake_model_name = "hey_jarvis"
         self._wake_lock = threading.Lock()
@@ -210,6 +219,8 @@ class VoiceInputEngine:
         self._device: int | str | None = settings.device
         self._hotkey_thread: threading.Thread | None = None
         self._last_mic_end_unix_ms: int | None = None
+        self._wake_frames: deque[bytes] = deque(maxlen=WAKE_FRAME_COUNT)
+        self._session = requests.Session()
 
     def start(self) -> None:
         if not self.settings.groq_api_key:
@@ -220,7 +231,8 @@ class VoiceInputEngine:
         elif self.settings.activation_mode not in {"hotkey", "api"}:
             raise RuntimeError("JARVIS_ACTIVATION_MODE must be hotkey, api, or wake")
         self._log_audio_devices()
-        self.settings.diagnostic_dir.mkdir(parents=True, exist_ok=True)
+        if self.settings.diagnostic:
+            self.settings.diagnostic_dir.mkdir(parents=True, exist_ok=True)
         LOGGER.info(
             "Audio config: sample_rate=%d Hz channels=1 chunk=%d samples/%d ms VAD=%d pre_roll=%d ms post_roll=%d ms end_silence=%d ms",
             SAMPLE_RATE,
@@ -268,6 +280,7 @@ class VoiceInputEngine:
             was_speaking = self._speaking
             self._conversation_active = conversation_active
             self._speaking = speaking
+            self._transition("SPEAKING" if speaking else ("LISTENING" if conversation_active else "IDLE"), "rust_state")
             if was_speaking and not speaking:
                 self._ignore_until = time.monotonic() + self.settings.post_tts_guard_ms / 1_000
                 self._reset_capture()
@@ -294,6 +307,7 @@ class VoiceInputEngine:
             return {
                 "conversation_active": self._conversation_active,
                 "speaking": self._speaking,
+                "state": self._state,
                 "stt_busy": self._stt_busy,
                 "running": not self._stop.is_set(),
                 "diagnostic": self.settings.diagnostic,
@@ -425,6 +439,7 @@ class VoiceInputEngine:
                 return
             self._conversation_active = True
             self._speaking = False
+            self._transition("ACTIVATED", "hotkey_or_api")
             self._ignore_until = 0.0
             self._reset_capture()
             self._pre_roll.clear()
@@ -530,7 +545,7 @@ class VoiceInputEngine:
             self._emit({"type": "stopped"})
 
     def process_frame(self, frame: bytes) -> None:
-        """Process one 80 ms PCM frame. Public for deterministic unit tests."""
+        """Process one 20 ms PCM frame. Public for deterministic unit tests."""
         rms, peak = audio_levels(frame)
         self._last_rms = rms
         self._last_peak = peak
@@ -546,11 +561,17 @@ class VoiceInputEngine:
             if self.settings.activation_mode != "wake":
                 self._log_levels_if_due(rms, peak, False)
                 return
-            samples = np.frombuffer(frame, dtype=np.int16)
+            self._wake_frames.append(frame)
+            ukrainian_text = self._ukrainian_wake_text(frame)
+            if len(self._wake_frames) < WAKE_FRAME_COUNT:
+                self._log_levels_if_due(rms, peak, False, 0.0, ukrainian_text)
+                return
+            wake_frame = b"".join(self._wake_frames)
+            self._wake_frames.clear()
+            samples = np.frombuffer(wake_frame, dtype=np.int16)
             with self._wake_lock:
                 predictions = self._wake_model.predict(samples)
                 score = float(predictions.get(self._wake_model_name, 0.0))
-                ukrainian_text = self._ukrainian_wake_text(frame)
             self._last_wake_score = score
             self._log_levels_if_due(rms, peak, False, score, ukrainian_text)
             if score >= self.settings.wake_threshold or contains_wake_word(
@@ -601,9 +622,9 @@ class VoiceInputEngine:
         energy_pass = rms >= energy_threshold
         self._last_vad_raw = raw_speech
         self._last_energy_gate = energy_pass
-        # Energy is the deterministic primary detector. WebRTC remains useful
-        # telemetry, but cannot discard Ukrainian speech on its own.
-        candidate_speech = energy_pass
+        # WebRTC and the adaptive energy gate vote together. Neither stationary
+        # noise energy nor an isolated WebRTC false positive can start capture.
+        candidate_speech = raw_speech and energy_pass
         if not self._speech_seen and not energy_pass:
             # Continue adapting during an active conversation, but only from
             # frames still below the current energy threshold. This also works
@@ -694,6 +715,7 @@ class VoiceInputEngine:
             self._reset_capture()
             with self._lock:
                 self._stt_busy = True
+                self._transition("TRANSCRIBING", "end_of_speech")
             LOGGER.info("Capture paused until the current Whisper request completes")
             threading.Thread(
                 target=self._transcribe,
@@ -730,13 +752,7 @@ class VoiceInputEngine:
         )
 
     def _is_speech(self, frame: bytes) -> bool:
-        # WebRTC VAD accepts only 10/20/30 ms, so split the 80 ms wake-word frame.
-        subframe_bytes = SAMPLE_RATE * 20 // 1_000 * 2
-        votes = [
-            self._vad.is_speech(frame[index:index + subframe_bytes], SAMPLE_RATE)
-            for index in range(0, len(frame), subframe_bytes)
-        ]
-        return sum(votes) >= 2
+        return self._vad.is_speech(frame, SAMPLE_RATE)
 
     def _noise_floor(self) -> float:
         if not self._noise_history:
@@ -810,20 +826,25 @@ class VoiceInputEngine:
             response = None
             for attempt, model in enumerate(models):
                 try:
-                    response = requests.post(
+                    request_started_unix_ms = int(time.time() * 1_000)
+                    data = {
+                        "model": model,
+                        "language": self.settings.language,
+                        "response_format": self.settings.stt_response_format,
+                        "temperature": "0",
+                        "prompt": self.settings.stt_prompt,
+                    }
+                    if self.settings.stt_response_format == "verbose_json":
+                        data["timestamp_granularities[]"] = "segment"
+                    response = self._session.post(
                         "https://api.groq.com/openai/v1/audio/transcriptions",
                         headers={"Authorization": f"Bearer {self.settings.groq_api_key}"},
                         files={"file": ("utterance.wav", wav, "audio/wav")},
-                        data={
-                            "model": model,
-                            "language": self.settings.language,
-                            "response_format": self.settings.stt_response_format,
-                            "timestamp_granularities[]": "segment",
-                            "temperature": "0",
-                            "prompt": self.settings.stt_prompt,
-                        },
-                        timeout=60,
+                        data=data,
+                        stream=True,
+                        timeout=(2.5, 15),
                     )
+                    stt_first_byte_unix_ms = request_started_unix_ms + int(response.elapsed.total_seconds() * 1_000)
                     response.raise_for_status()
                     selected_model = model
                     break
@@ -852,7 +873,8 @@ class VoiceInputEngine:
                 "model": selected_model,
             }
             LOGGER.info("Whisper transcript EXACT: %r", text)
-            LOGGER.info("Whisper metadata: %s", json.dumps(metadata, ensure_ascii=False, separators=(",", ":")))
+            if self.settings.diagnostic:
+                LOGGER.info("Whisper metadata: %s", json.dumps(metadata, ensure_ascii=False, separators=(",", ":")))
             if rejected_reason:
                 LOGGER.warning("Transcript rejected: %s", rejected_reason)
             elif text:
@@ -860,6 +882,7 @@ class VoiceInputEngine:
                     "type": "transcript",
                     "text": text,
                     "mic_end_unix_ms": self._last_mic_end_unix_ms,
+                    "stt_first_byte_unix_ms": stt_first_byte_unix_ms,
                     "stt_done_unix_ms": stt_done_unix_ms,
                 })
         except Exception as error:
@@ -868,7 +891,16 @@ class VoiceInputEngine:
         finally:
             with self._lock:
                 self._stt_busy = False
+                self._transition("LISTENING" if self._conversation_active else "IDLE", "stt_complete")
             LOGGER.info("Capture resumed after Whisper request")
+
+    def _transition(self, new_state: str, reason: str) -> None:
+        old_state = self._state
+        if old_state == new_state:
+            return
+        self._state = new_state
+        if self.settings.diagnostic:
+            LOGGER.info("Voice state: %s -> %s reason=%s", old_state, new_state, reason)
 
     def _save_diagnostic_wavs(self, raw_pcm: bytes, whisper_pcm: bytes | None) -> None:
         if not self.settings.diagnostic:
@@ -1062,7 +1094,7 @@ app = FastAPI(title="JARVIS Voice Input Core", version="0.2.0", lifespan=lifespa
 
 @app.get("/health")
 def health() -> dict[str, object]:
-    return {"status": "ok", **engine.get_state()}
+    return {"status": "ok", "service": "jarvis_voice_input", "chunk_ms": FRAME_MS, **engine.get_state()}
 
 
 @app.get("/devices")

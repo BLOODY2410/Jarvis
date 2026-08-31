@@ -1,6 +1,6 @@
 # Voice Input Core
 
-Сервіс `127.0.0.1:8766` реалізує детермінований half-duplex шлях `мікрофон → adaptive VAD → Groq Whisper → Rust`. До 3,5 с озвученого тексту використовується `whisper-large-v3-turbo`, а довше аудіо та fallback використовують `whisper-large-v3`. Для коротких команд VAD завершує запис після 560 мс тиші; після 3 с мовлення застосовується довший configurable timeout.
+Сервіс `127.0.0.1:8766` реалізує детермінований half-duplex шлях `мікрофон → adaptive VAD → Groq Whisper → Rust` на 20-мс кадрах. До 3,5 с озвученого тексту використовується `whisper-large-v3-turbo`, а довше аудіо та fallback використовують `whisper-large-v3`. Для коротких команд VAD завершує запис після 440 мс тиші; після 3 с мовлення застосовується довший configurable timeout.
 
 Основний режим — `JARVIS_ACTIVATION_MODE=hotkey`: натисніть `Ctrl+Alt+J`. Та сама дія доступна як `POST /activate`. Під час TTS, виконання команди та Whisper новий запис не починається.
 
@@ -19,7 +19,7 @@ cd D:\Jarvis
 .\start.ps1
 ```
 
-Діагностичні WAV зберігаються у `diagnostics\last_raw.wav` та `diagnostics\last_whisper.wav`. Якщо автоматично вибрано не той пристрій, задайте `JARVIS_MIC_DEVICE` у `D:\Jarvis\.env`.
+У `JARVIS_PROFILE=production` діагностичні WAV не створюються. Для тимчасової діагностики задайте `JARVIS_PROFILE=debug`; тоді WAV зберігаються у `diagnostics\last_raw.wav` та `diagnostics\last_whisper.wav`. Якщо автоматично вибрано не той пристрій, задайте `JARVIS_MIC_DEVICE` у `D:\Jarvis\.env`.
 
 Експериментальний `JARVIS_ACTIVATION_MODE=wake` лишає старі openWakeWord/Vosk модулі доступними для окремих вимірювань, але не є стандартним режимом через нестабільність українського «Джарвіс».
 

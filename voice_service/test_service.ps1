@@ -22,6 +22,7 @@ foreach ($index in 0..($phrases.Count - 1)) {
         $response = Invoke-WebRequest `
             -Uri "$BaseUrl/synthesize" `
             -Method Post `
+            -UseBasicParsing `
             -ContentType 'application/json; charset=utf-8' `
             -Body ([Text.Encoding]::UTF8.GetBytes($body)) `
             -OutFile $output `

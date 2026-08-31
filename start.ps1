@@ -15,29 +15,63 @@ New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
 $env:PYTHONUTF8 = '1'
 $startedPids = [System.Collections.Generic.List[int]]::new()
 
-function Test-Health([string]$Uri) {
-    try {
-        $response = Invoke-RestMethod -Uri $Uri -TimeoutSec 2
-        return $null -ne $response
-    } catch {
-        return $false
+function Test-Configuration {
+    $envPath = Join-Path $projectRoot '.env'
+    if (-not (Test-Path -LiteralPath $envPath)) { throw 'Missing D:\Jarvis\.env. Copy .env.example and add your keys.' }
+    $entries = @{}
+    foreach ($line in Get-Content -LiteralPath $envPath) {
+        if ($line -match '^\s*([^#=\s]+)\s*=\s*(.*)\s*$') { $entries[$matches[1]] = $matches[2] }
     }
+    if (-not $entries.ContainsKey('GROQ_API_KEY') -or [string]::IsNullOrWhiteSpace($entries['GROQ_API_KEY']) -or $entries['GROQ_API_KEY'] -match 'replace_me') {
+        throw 'GROQ_API_KEY is missing or still a placeholder in .env.'
+    }
+}
+
+function Rotate-Log([string]$Path) {
+    if ((Test-Path -LiteralPath $Path) -and (Get-Item -LiteralPath $Path).Length -gt 5MB) {
+        $archive = "$Path.1"
+        if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }
+        Move-Item -LiteralPath $Path -Destination $archive
+    }
+}
+
+function Get-Health([string]$Uri) {
+    try {
+        return Invoke-RestMethod -Uri $Uri -TimeoutSec 2
+    } catch {
+        return $null
+    }
+}
+
+function Test-ServiceIdentity([int]$Port, $Health) {
+    if ($null -eq $Health) { return $false }
+    if ($Port -eq 8765) { return $Health.service -eq 'jarvis_voice' }
+    if ($Port -eq 8766) { return $Health.service -eq 'jarvis_voice_input' }
+    return $false
 }
 
 function Start-LocalService([string]$Name, [string]$Directory, [int]$Port) {
     $healthUri = "http://127.0.0.1:$Port/health"
-    if (Test-Health $healthUri) {
+    $existing = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    $health = Get-Health $healthUri
+    if ($existing -and -not (Test-ServiceIdentity $Port $health)) {
+        throw "Port $Port is occupied by a process that is not the expected JARVIS service (PID $($existing.OwningProcess))."
+    }
+    if ($existing -and (Test-ServiceIdentity $Port $health)) {
         Write-Host "$Name already ready on port $Port."
         return
     }
     $stdout = Join-Path $logRoot "$Name.log"
     $stderr = Join-Path $logRoot "$Name-error.log"
+    Rotate-Log $stdout
+    Rotate-Log $stderr
     $process = Start-Process -FilePath $python `
         -ArgumentList @('-m', 'uvicorn', 'app:app', '--host', '127.0.0.1', '--port', "$Port") `
         -WorkingDirectory $Directory -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     for ($attempt = 0; $attempt -lt 120; $attempt++) {
-        if (Test-Health $healthUri) {
+        $health = Get-Health $healthUri
+        if (Test-ServiceIdentity $Port $health) {
             $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop | Select-Object -First 1
             $startedPids.Add([int]$listener.OwningProcess)
             Write-Host "$Name ready."
@@ -53,10 +87,11 @@ function Start-LocalService([string]$Name, [string]$Directory, [int]$Port) {
 
 function Test-TtsSynthesis {
     $checkPath = Join-Path $logRoot 'startup-tts-check.wav'
-    $body = @{ text = 'Готово.' } | ConvertTo-Json -Compress
+    $body = @{ text = 'Jarvis startup check.' } | ConvertTo-Json -Compress
     $response = Invoke-WebRequest `
         -Uri 'http://127.0.0.1:8765/synthesize' `
         -Method Post `
+        -UseBasicParsing `
         -ContentType 'application/json; charset=utf-8' `
         -Body ([Text.Encoding]::UTF8.GetBytes($body)) `
         -OutFile $checkPath `
@@ -71,10 +106,11 @@ function Test-TtsSynthesis {
 }
 
 try {
+    Test-Configuration
     Start-LocalService 'voice-service' (Join-Path $projectRoot 'voice_service') 8765
     Test-TtsSynthesis
     Start-LocalService 'voice-input' (Join-Path $projectRoot 'voice_input_service') 8766
-    Write-Host 'JARVIS ready. Press Ctrl+Alt+J, wait for the greeting, then speak.'
+    Write-Host 'JARVIS ready. Press Ctrl+Alt+J, wait for the short cue, then speak.'
     Set-Location -LiteralPath $projectRoot
     & $cargo run
 } finally {

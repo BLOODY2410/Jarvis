@@ -12,14 +12,14 @@ import wave
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Literal, TypeAlias
+from typing import Iterator, Literal, TypeAlias
 
 import numpy as np
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pedalboard import Compressor, Gain, HighpassFilter, HighShelfFilter, Limiter, LowShelfFilter, PeakFilter, Pedalboard, Reverb, time_stretch
 from piper import PiperVoice, SynthesisConfig
 from pydantic import BaseModel, Field
@@ -99,6 +99,7 @@ class FishAudioSettings:
     retries: int
     retry_delay: float
     fx_enabled: bool
+    allow_paid_fallback: bool = False
 
     @classmethod
     def from_environment(cls) -> "FishAudioSettings":
@@ -117,6 +118,7 @@ class FishAudioSettings:
             retries=max(0, int(os.getenv("FISH_AUDIO_RETRIES", "1"))),
             retry_delay=max(0.0, float(os.getenv("FISH_AUDIO_RETRY_DELAY_SECS", "0.25"))),
             fx_enabled=env_bool("FISH_AUDIO_FX_ENABLED", False),
+            allow_paid_fallback=env_bool("FISH_AUDIO_ALLOW_PAID_FALLBACK", False),
         )
 
     @property
@@ -251,17 +253,41 @@ class PiperVoiceService:
         self.voice: PiperVoice | None = None
         self.native_sample_rate = 0
         self._lock = threading.Lock()
+        self._load_lock = threading.Lock()
+        self._ready = threading.Event()
+        self._load_error: BaseException | None = None
 
     def load(self) -> None:
-        model_path = ensure_model(self.settings.model_dir)
-        LOGGER.info("Loading Piper voice %s...", model_path)
-        self.voice = PiperVoice.load(str(model_path), use_cuda=False)
-        self.native_sample_rate = int(self.voice.config.sample_rate)
-        LOGGER.info("Piper %s loaded at %d Hz", MODEL_ID, self.native_sample_rate)
+        if self._ready.is_set():
+            return
+        with self._load_lock:
+            if self._ready.is_set():
+                return
+            try:
+                model_path = ensure_model(self.settings.model_dir)
+                LOGGER.info("Loading Piper voice %s...", model_path)
+                self.voice = PiperVoice.load(str(model_path), use_cuda=False)
+                self.native_sample_rate = int(self.voice.config.sample_rate)
+                LOGGER.info("Piper %s loaded at %d Hz", MODEL_ID, self.native_sample_rate)
+            except BaseException as error:
+                self._load_error = error
+                raise
+            finally:
+                self._ready.set()
+
+    def ensure_loaded(self) -> None:
+        if self.voice is not None:
+            self._ready.set()
+            return
+        if not self._ready.is_set():
+            self.load()
+        if self._load_error is not None:
+            raise RuntimeError(f"Piper fallback failed to load: {safe_error(self._load_error)}") from self._load_error
+        if self.voice is None:
+            raise RuntimeError("Piper fallback is not ready")
 
     def synthesize(self, request: SynthesisRequest) -> tuple[bytes, str, int]:
-        if self.voice is None:
-            raise RuntimeError("The Piper voice is not loaded yet")
+        self.ensure_loaded()
         speed = request.speed or self.settings.speed
         mode = request.mode or self.settings.default_mode
         use_fx = (self.settings.fx_enabled if request.fx_enabled is None else request.fx_enabled) and mode != "raw"
@@ -309,6 +335,7 @@ class FishAudioService:
                 and model == "s2.1-pro-free"
                 and self.settings.fallback_model
                 and self.settings.fallback_model != model
+                and self.settings.allow_paid_fallback
             ):
                 audio = self._request_audio(request, self.settings.fallback_model)
                 with self._model_lock:
@@ -388,6 +415,55 @@ class FishAudioService:
             if self.settings.retry_delay:
                 time.sleep(self.settings.retry_delay * (attempt + 1))
         raise last_error or FishAudioError("Fish Audio request failed")
+
+    def open_pcm_stream(self, request: SynthesisRequest) -> tuple[requests.Response, str]:
+        """Open Fish's response without consuming it; caller owns the response."""
+        if not self.settings.configured:
+            raise FishAudioError(self.settings.unavailable_reason or "fish_not_configured")
+        model = self.effective_model
+        response = self._open_response(request, model)
+        if response.status_code == 200:
+            return response, model
+        status = response.status_code
+        response.close()
+        if (
+            status in self._MODEL_REJECTION_STATUS
+            and model == "s2.1-pro-free"
+            and self.settings.allow_paid_fallback
+            and self.settings.fallback_model
+            and self.settings.fallback_model != model
+        ):
+            model = self.settings.fallback_model
+            response = self._open_response(request, model)
+            if response.status_code == 200:
+                with self._model_lock:
+                    self.effective_model = model
+                return response, model
+            status = response.status_code
+            response.close()
+        raise FishAudioError(f"Fish Audio returned HTTP {status}", status)
+
+    def _open_response(self, request: SynthesisRequest, model: str) -> requests.Response:
+        payload: dict[str, object] = {
+            "text": request.text.strip(),
+            "reference_id": self.settings.reference_id,
+            "format": "wav",
+            "latency": self.settings.latency,
+            "sample_rate": request.sample_rate or 44_100,
+            "prosody": {"speed": request.speed or 1.0, "volume": 0, "normalize_loudness": True},
+        }
+        return self._session.post(
+            self.settings.endpoint,
+            headers={
+                "Authorization": f"Bearer {self.settings.api_key}",
+                "Content-Type": "application/json",
+                "Accept": "audio/wav",
+                "model": model,
+            },
+            json=payload,
+            stream=True,
+            timeout=(self.settings.connect_timeout, self.settings.read_timeout),
+        )
 
 
 class AudioCache:
@@ -474,6 +550,7 @@ class VoiceRouter:
         return self._piper_result(request, fallback_from="fish" if requested == "fish" else None)
 
     def _piper_result(self, request: SynthesisRequest, fallback_from: str | None = None) -> SynthesisResult:
+        self.piper.ensure_loaded()
         audio, mode, sample_rate = self.piper.synthesize(request)
         result = SynthesisResult(
             audio, "piper", MODEL_ID, "mykyta", mode, sample_rate,
@@ -488,12 +565,13 @@ class VoiceRouter:
             self.last_error = error
 
     def prewarm(self) -> None:
-        if self.settings.provider != "auto" or not self.fish.settings.configured:
+        if self.settings.provider not in {"auto", "fish"} or not self.fish.settings.configured:
             return
         phrases = [
-            "До ваших послуг, пане.",
-            "Завдання виконано.",
+            "Так, пане.",
+            "Виконую.",
             "Готово.",
+            "Не вдалося виконати.",
         ]
         for text in phrases:
             try:
@@ -648,8 +726,10 @@ voice = VoiceRouter(settings, fish, piper, AudioCache(settings.cache_dir, settin
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    await run_in_threadpool(piper.load)
-    # Fill acknowledgement cache without blocking service readiness.
+    # Fish-primary readiness does not wait for the heavy local model. Piper is
+    # prepared in parallel and ensure_loaded() safely waits if an early fallback
+    # reaches it first.
+    threading.Thread(target=piper.load, name="piper-lazy-load", daemon=True).start()
     threading.Thread(target=voice.prewarm, name="fish-cache-prewarm", daemon=True).start()
     yield
 
@@ -662,7 +742,8 @@ async def health() -> dict[str, object]:
     configured_provider = settings.provider
     preferred_provider = "fish" if configured_provider == "auto" and fish_settings.configured else configured_provider
     return {
-        "status": "ready" if piper.voice is not None else "loading",
+        "service": "jarvis_voice",
+        "status": "ready" if preferred_provider == "fish" or piper.voice is not None else "loading",
         "engine": preferred_provider,
         "provider_mode": configured_provider,
         "active_provider": voice.last_provider,
@@ -680,6 +761,7 @@ async def health() -> dict[str, object]:
             "reference": masked_reference(fish_settings.reference_id),
             "latency": fish_settings.latency,
             "fx_enabled": fish_settings.fx_enabled,
+            "paid_fallback_allowed": fish_settings.allow_paid_fallback,
         },
         "piper": {"ready": piper.voice is not None, "model": MODEL_ID, "fx_enabled": settings.fx_enabled},
         "cache": {"directory": str(settings.cache_dir), "max_phrase_chars": settings.cache_max_chars},
@@ -706,3 +788,100 @@ async def synthesize(request: SynthesisRequest) -> Response:
         "X-Jarvis-Cache": "hit" if result.cache_hit else "miss",
         "X-Jarvis-Fallback-From": result.fallback_from or "none",
     })
+
+
+ACKNOWLEDGEMENTS = {
+    "yes": "Так, пане.",
+    "working": "Виконую.",
+    "done": "Готово.",
+    "failed": "Не вдалося виконати.",
+}
+
+
+@app.get("/ack/{name}")
+async def acknowledgement(name: str) -> Response:
+    """Return only pre-generated Fish audio; never make a live cloud call."""
+    text = ACKNOWLEDGEMENTS.get(name)
+    if text is None:
+        raise HTTPException(status_code=404, detail="unknown_acknowledgement")
+    request = SynthesisRequest(text=text, provider="fish")
+    provider = "fish_fx" if fish.settings.fx_enabled else "fish"
+    key = voice.cache.key(provider, fish.effective_model, fish.settings.reference_id, request)
+    audio = voice.cache.read(key)
+    if audio is None:
+        return Response(status_code=204, headers={"X-Jarvis-Cache": "miss"})
+    return Response(
+        content=audio,
+        media_type="audio/wav",
+        headers={"X-Jarvis-Cache": "hit", "X-Jarvis-Provider": "fish"},
+    )
+
+
+def wav_pcm_chunks(response: requests.Response) -> Iterator[bytes]:
+    """Strip a streamed PCM WAV container and yield only its data chunk."""
+    header = bytearray()
+    data_remaining: int | None = None
+    try:
+        for chunk in response.iter_content(chunk_size=8 * 1024):
+            if not chunk:
+                continue
+            if data_remaining is None:
+                header.extend(chunk)
+                marker = header.find(b"data")
+                if marker < 0 or len(header) < marker + 8:
+                    if len(header) > 64 * 1024:
+                        raise FishAudioError("Fish Audio WAV header is too large")
+                    continue
+                data_remaining = int.from_bytes(header[marker + 4:marker + 8], "little")
+                chunk = bytes(header[marker + 8:])
+                header.clear()
+            if data_remaining <= 0:
+                break
+            output = chunk[:data_remaining]
+            data_remaining -= len(output)
+            if output:
+                yield output
+    finally:
+        response.close()
+
+
+@app.post("/synthesize/stream")
+async def synthesize_stream(request: SynthesisRequest) -> StreamingResponse:
+    """Stream signed 16-bit mono PCM; the legacy WAV endpoint remains intact."""
+    request.sample_rate = request.sample_rate or 44_100
+    try:
+        response, model = await run_in_threadpool(fish.open_pcm_stream, request)
+        first_byte_ms = int(time.time() * 1_000)
+        LOGGER.info("TTS stream headers ready: provider=fish model=%s first_byte_ms=%d", model, first_byte_ms)
+        voice._remember("fish", None)
+        return StreamingResponse(
+            wav_pcm_chunks(response),
+            media_type="audio/L16",
+            headers={
+                "X-Jarvis-Provider": "fish",
+                "X-Jarvis-Model": model,
+                "X-Jarvis-Sample-Rate": str(request.sample_rate),
+                "X-Jarvis-Channels": "1",
+                "X-Jarvis-Sample-Format": "s16le",
+            },
+        )
+    except Exception as error:
+        LOGGER.warning("Fish streaming unavailable; returning Piper PCM (%s)", safe_error(error))
+        try:
+            result = await run_in_threadpool(voice._piper_result, request, "fish")
+            pcm, sample_rate = decode_wav(result.audio)
+            raw = (np.clip(pcm, -1.0, 1.0) * 32767.0).round().astype("<i2").tobytes()
+            return StreamingResponse(
+                iter((raw,)),
+                media_type="audio/L16",
+                headers={
+                    "X-Jarvis-Provider": "piper",
+                    "X-Jarvis-Model": MODEL_ID,
+                    "X-Jarvis-Sample-Rate": str(sample_rate),
+                    "X-Jarvis-Channels": "1",
+                    "X-Jarvis-Sample-Format": "s16le",
+                    "X-Jarvis-Fallback-From": "fish",
+                },
+            )
+        except Exception as fallback_error:
+            raise HTTPException(status_code=503, detail=safe_error(fallback_error)) from fallback_error

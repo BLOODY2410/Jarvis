@@ -1,7 +1,10 @@
 use std::{
+    collections::VecDeque,
     error::Error,
+    fs::{self, OpenOptions},
     io,
     io::Write,
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -10,7 +13,7 @@ use crate::{
     core::fast_command::match_fast_command,
     core::messages::Message,
     tools::ToolRegistry,
-    voice::{PlaybackCancellation, VoiceClient},
+    voice::{PlaybackCancellation, VoiceClient, play_activation_cue},
     voice_input::{VoiceEvent, VoiceInputClient},
 };
 
@@ -42,6 +45,28 @@ enum PlaybackOutcome {
     Completed,
     Transcript(String),
     Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceState {
+    Idle,
+    Activated,
+    Listening,
+    Transcribing,
+    Executing,
+    Speaking,
+}
+
+fn transition(state: &mut VoiceState, next: VoiceState, reason: &str) {
+    if *state != next {
+        if std::env::var("JARVIS_PROFILE")
+            .map(|value| value.eq_ignore_ascii_case("debug"))
+            .unwrap_or(false)
+        {
+            println!("[Voice State] {:?} -> {:?} reason={reason}", *state, next);
+        }
+        *state = next;
+    }
 }
 
 impl Agent {
@@ -116,6 +141,7 @@ impl Agent {
     async fn run_voice(&mut self, input: VoiceInputClient) -> Result<(), Box<dyn Error>> {
         println!("Голосовий режим активний. Натисніть Ctrl+Alt+J. Ctrl+C — аварійний вихід.\n");
         input.set_state(false, false).await?;
+        let mut voice_state = VoiceState::Idle;
         let mut conversation_deadline: Option<Instant> = None;
 
         loop {
@@ -127,6 +153,7 @@ impl Agent {
             if wait.is_zero() {
                 conversation_deadline = None;
                 input.set_state(false, false).await?;
+                transition(&mut voice_state, VoiceState::Idle, "conversation_timeout");
                 println!("[Voice Input] Розмовну сесію завершено. Натисніть Ctrl+Alt+J.");
                 continue;
             }
@@ -148,22 +175,41 @@ impl Agent {
 
             match event {
                 VoiceEvent::Wake => {
+                    transition(&mut voice_state, VoiceState::Activated, "activation_event");
                     conversation_deadline = Some(Instant::now() + self.conversation_timeout);
                     println!("[Voice Input] Слухаю...");
-                    if let Some(voice) = self.voice.clone() {
+                    if self.voice.is_some() {
                         input.set_state(true, true).await?;
-                        if let Err(error) = voice.speak("До ваших послуг, пане.").await
+                        transition(
+                            &mut voice_state,
+                            VoiceState::Speaking,
+                            "local_activation_cue",
+                        );
+                        if let Err(error) = tokio::task::spawn_blocking(play_activation_cue)
+                            .await
+                            .map_err(io::Error::other)?
                         {
                             eprintln!("[Voice Core] {error}");
                         }
                     }
                     input.set_state(true, false).await?;
+                    transition(
+                        &mut voice_state,
+                        VoiceState::Listening,
+                        "activation_cue_complete",
+                    );
                 }
                 VoiceEvent::Transcript {
                     text,
                     mic_end_unix_ms,
+                    stt_first_byte_unix_ms,
                     stt_done_unix_ms,
                 } => {
+                    transition(
+                        &mut voice_state,
+                        VoiceState::Transcribing,
+                        "transcript_received",
+                    );
                     let text = clean_wake_word(&text);
                     if text.is_empty() {
                         continue;
@@ -172,6 +218,11 @@ impl Agent {
                     if let Some(command) = match_fast_command(&text) {
                         let intent_at = unix_ms();
                         let tool_start = unix_ms();
+                        transition(
+                            &mut voice_state,
+                            VoiceState::Executing,
+                            "fast_intent_matched",
+                        );
                         let tools = self.tools.clone();
                         let intent = command.intent;
                         let arguments = command.arguments.clone();
@@ -196,6 +247,7 @@ impl Agent {
                         let tts_start = self.voice.as_ref().map(|_| unix_ms());
                         log_fast_latency(
                             mic_end_unix_ms,
+                            stt_first_byte_unix_ms,
                             stt_done_unix_ms,
                             intent_at,
                             tool_start,
@@ -204,7 +256,22 @@ impl Agent {
                         );
 
                         if let Some(voice) = self.voice.clone() {
-                            match self.speak_with_barge_in(&input, &voice, &answer).await {
+                            transition(
+                                &mut voice_state,
+                                VoiceState::Speaking,
+                                "fast_acknowledgement",
+                            );
+                            let playback = if answer == command.acknowledgement {
+                                input.set_state(true, true).await?;
+                                if let Err(error) = voice.speak_ack("working").await {
+                                    eprintln!("[Voice Core] {error}");
+                                }
+                                let _ = input.set_state(true, false).await;
+                                PlaybackOutcome::Completed
+                            } else {
+                                self.speak_with_barge_in(&input, &voice, &answer).await
+                            };
+                            match playback {
                                 PlaybackOutcome::Transcript(interrupted_text)
                                     if !interrupted_text.is_empty() =>
                                 {
@@ -213,20 +280,43 @@ impl Agent {
                                 PlaybackOutcome::Stopped => return self.run_text().await,
                                 PlaybackOutcome::Completed | PlaybackOutcome::Transcript(_) => {}
                             }
+                            transition(
+                                &mut voice_state,
+                                VoiceState::Listening,
+                                "fast_ack_complete",
+                            );
                         } else {
                             input.set_state(true, false).await?;
+                            transition(
+                                &mut voice_state,
+                                VoiceState::Listening,
+                                "tool_complete_no_tts",
+                            );
                         }
                         continue;
                     }
                     // LLM fallback keeps the microphone closed while the agent
                     // thinks and performs tools, not only during audible TTS.
                     input.set_state(true, true).await?;
+                    transition(&mut voice_state, VoiceState::Executing, "llm_fallback");
+                    let llm_started = unix_ms();
                     match self.respond(&text).await {
                         Ok(answer) => {
+                            let llm_done = unix_ms();
+                            println!(
+                                "[Latency] llm_path=true speech_end->llm_start={} llm_total={} ms",
+                                metric(elapsed_ms(mic_end_unix_ms, Some(llm_started))),
+                                llm_done.saturating_sub(llm_started)
+                            );
                             println!("\nJARVIS: {answer}\n");
                             conversation_deadline =
                                 Some(Instant::now() + self.conversation_timeout);
                             if let Some(voice) = self.voice.clone() {
+                                transition(
+                                    &mut voice_state,
+                                    VoiceState::Speaking,
+                                    "llm_response_ready",
+                                );
                                 match self.speak_with_barge_in(&input, &voice, &answer).await {
                                     PlaybackOutcome::Transcript(interrupted_text)
                                         if !interrupted_text.is_empty() =>
@@ -262,8 +352,18 @@ impl Agent {
                                     PlaybackOutcome::Completed | PlaybackOutcome::Transcript(_) => {
                                     }
                                 }
+                                transition(
+                                    &mut voice_state,
+                                    VoiceState::Listening,
+                                    "llm_playback_complete",
+                                );
                             } else {
                                 input.set_state(true, false).await?;
+                                transition(
+                                    &mut voice_state,
+                                    VoiceState::Listening,
+                                    "llm_complete_no_tts",
+                                );
                             }
                         }
                         Err(error) => {
@@ -346,9 +446,20 @@ impl Agent {
             }
 
             for call in tool_calls {
+                let tool_started = unix_ms();
+                println!(
+                    "[Latency] llm_tool={} tool_started={tool_started}",
+                    call.function.name
+                );
                 let result = self
                     .tools
                     .execute(&call.function.name, &call.function.arguments);
+                let tool_done = unix_ms();
+                println!(
+                    "[Latency] llm_tool={} tool_done={tool_done} tool_total={} ms",
+                    call.function.name,
+                    tool_done.saturating_sub(tool_started)
+                );
                 self.history.push(Message::tool(call.id, result));
             }
         }
@@ -392,6 +503,7 @@ fn elapsed_ms(start: Option<u64>, end: Option<u64>) -> Option<u64> {
 
 fn log_fast_latency(
     mic_end: Option<u64>,
+    stt_first_byte: Option<u64>,
     stt_done: Option<u64>,
     intent_at: u64,
     tool_start: u64,
@@ -400,14 +512,56 @@ fn log_fast_latency(
 ) {
     let total_end = tts_start.unwrap_or(tool_done);
     println!(
-        "[Latency] fast_path=true mic_end->stt_done={} stt_done->intent={} intent->tool_start={} tool_start->tool_done={} tool_done->tts_start={} total={} ms",
+        "[Latency] fast_path=true speech_end->stt_first_byte={} speech_end->stt_done={} stt_done->intent={} intent->tool_start={} tool_start->tool_done={} tool_done->tts_start={} speech_end->tool_start={} total={} ms",
+        metric(elapsed_ms(mic_end, stt_first_byte)),
         metric(elapsed_ms(mic_end, stt_done)),
         metric(elapsed_ms(stt_done, Some(intent_at))),
         metric(elapsed_ms(Some(intent_at), Some(tool_start))),
         metric(elapsed_ms(Some(tool_start), Some(tool_done))),
         metric(elapsed_ms(Some(tool_done), tts_start)),
+        metric(elapsed_ms(mic_end, Some(tool_start))),
         metric(elapsed_ms(mic_end, Some(total_end))),
     );
+    if let Some(speech_to_tool_start) = elapsed_ms(mic_end, Some(tool_start)) {
+        record_latency_sample("fast_path", speech_to_tool_start, mic_end, tool_start);
+    }
+}
+
+fn record_latency_sample(path: &str, latency_ms: u64, speech_end: Option<u64>, tool_start: u64) {
+    static FAST_SAMPLES: OnceLock<Mutex<VecDeque<u64>>> = OnceLock::new();
+    let samples = FAST_SAMPLES.get_or_init(|| Mutex::new(VecDeque::with_capacity(200)));
+    if let Ok(mut values) = samples.lock() {
+        if values.len() == 200 {
+            values.pop_front();
+        }
+        values.push_back(latency_ms);
+        if values.len() >= 20 && values.len() % 5 == 0 {
+            let mut sorted: Vec<_> = values.iter().copied().collect();
+            sorted.sort_unstable();
+            let median = sorted[sorted.len() / 2];
+            let p95 = sorted[((sorted.len() as f64 * 0.95).ceil() as usize)
+                .saturating_sub(1)
+                .min(sorted.len() - 1)];
+            println!(
+                "[Benchmark] path={path} samples={} median={median}ms p95={p95}ms",
+                sorted.len()
+            );
+        }
+    }
+    let _ = fs::create_dir_all("logs");
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("logs/latency.jsonl")
+    {
+        let line = serde_json::json!({
+            "path": path,
+            "speech_end_unix_ms": speech_end,
+            "tool_start_unix_ms": tool_start,
+            "speech_end_to_tool_start_ms": latency_ms,
+        });
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 fn metric(value: Option<u64>) -> String {
@@ -452,7 +606,8 @@ fn fast_answer(intent: &str, result: &str, acknowledgement: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::clean_wake_word;
+    use super::{clean_wake_word, fast_answer};
+    use crate::core::fast_command::match_fast_command;
 
     #[test]
     fn strips_supported_wake_words() {
@@ -462,5 +617,23 @@ mod tests {
         );
         assert_eq!(clean_wake_word("hey jarvis open browser"), "open browser");
         assert_eq!(clean_wake_word("Яка погода?"), "Яка погода?");
+    }
+
+    #[test]
+    fn transcript_to_fast_path_to_cached_ack_contract() {
+        // Integration boundary without live microphone/cloud/tool mutation:
+        // Ukrainian transcript -> matcher -> mocked safe tool result -> static ack.
+        let transcript = clean_wake_word("Джарвіс, відкрий мені ютуб");
+        let command = match_fast_command(&transcript).expect("must bypass the LLM");
+        assert_eq!(command.intent, "open_url");
+        let tool_result = r#"{"success":true,"result":"mock-safe-tool"}"#;
+        assert_eq!(
+            fast_answer(command.intent, tool_result, command.acknowledgement),
+            command.acknowledgement
+        );
+        assert!(matches!(
+            command.acknowledgement,
+            "Виконую, пане." | "Виконую."
+        ));
     }
 }

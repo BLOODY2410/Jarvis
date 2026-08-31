@@ -17,12 +17,15 @@ FISH_AUDIO_CONNECT_TIMEOUT_SECS=2.5
 FISH_AUDIO_READ_TIMEOUT_SECS=12
 FISH_AUDIO_RETRIES=1
 FISH_AUDIO_FX_ENABLED=false
+FISH_AUDIO_ALLOW_PAID_FALLBACK=false
 JARVIS_TTS_CACHE_MAX_CHARS=120
 ```
 
 `FISH_AUDIO_REFERENCE_ID` — ID голосової моделі Fish Audio. Також підтримується сумісна назва `FISH_AUDIO_VOICE_ID`. Якщо ключа або ID немає, `/health` покаже `missing_api_key` чи `missing_reference_id`, а `auto` без зупинки використовуватиме Piper.
 
-Fish повертає WAV у low-latency режимі, а сервіс читає HTTP-відповідь потоково. WebSocket не використовується навмисно: Rust очікує один завершений WAV, тож WebSocket не скоротив би час до початку відтворення без зміни контракту. Короткі фрази до 120 символів кешуються у `voice_service\cache`; три типові підтвердження прогріваються у фоні після запуску.
+`POST /synthesize/stream` віддає PCM chunks одразу після Fish, і Rust починає playback після мінімального буфера; сумісний `POST /synthesize` як і раніше повертає завершений WAV. Чотири типові підтвердження прогріваються у фоні, а `GET /ack/{name}` ніколи не робить live cloud call. Piper завантажується у фоні й безпечно очікується лише при fallback.
+
+Перехід із `s2.1-pro-free` на платну модель заборонений за замовчуванням. Він можливий лише після явного `FISH_AUDIO_ALLOW_PAID_FALLBACK=true`; інакше будь-яке відхилення free-моделі переходить у Piper.
 
 Застарілий Piper JARVIS FX за замовчуванням не накладається на Fish (`FISH_AUDIO_FX_ENABLED=false`). Для Piper він лишається доступним через `JARVIS_TTS_MODE=jarvis_reference` та `JARVIS_FX_ENABLED=true`.
 

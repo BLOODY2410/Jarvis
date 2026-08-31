@@ -7,6 +7,7 @@ import wave
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -14,6 +15,7 @@ from app import (
     AudioCache,
     FishAudioError,
     FishAudioSettings,
+    FishAudioService,
     FxSettings,
     JarvisFx,
     PiperVoiceService,
@@ -131,6 +133,22 @@ class RouterTests(unittest.TestCase):
                 self.assertEqual(result.provider, "piper")
                 self.assertEqual(result.fallback_from, "fish")
                 self.assertEqual(result.mode, "raw")
+
+    def test_paid_fish_fallback_is_forbidden_by_default(self) -> None:
+        fish = FishAudioService(self.fish_settings, JarvisFx(FxSettings.from_environment()))
+        with patch.object(fish, "_request_audio", side_effect=FishAudioError("rejected", 400)) as request:
+            with self.assertRaises(FishAudioError):
+                fish.synthesize(SynthesisRequest(text="Без платного fallback."))
+        self.assertEqual(request.call_count, 1)
+
+    def test_paid_fish_fallback_requires_explicit_opt_in(self) -> None:
+        settings = replace(self.fish_settings, allow_paid_fallback=True)
+        fish = FishAudioService(settings, JarvisFx(FxSettings.from_environment()))
+        audio = encode_wav(np.zeros(2_000, dtype=np.float32), 44_100)
+        with patch.object(fish, "_request_audio", side_effect=[FishAudioError("rejected", 400), audio]) as request:
+            result = fish.synthesize(SynthesisRequest(text="Явний opt-in."))
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(result.model, "s2-pro")
 
     def test_reference_preset_is_stereo_and_keeps_duration(self) -> None:
         wav_bytes, mode, sample_rate = self.service.synthesize(

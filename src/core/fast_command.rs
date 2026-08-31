@@ -17,6 +17,7 @@ pub fn match_fast_command(input: &str) -> Option<FastCommand> {
         &text,
         &[
             "зроби голосніше",
+            "зробити голосніше",
             "збільш гучність",
             "додай гучність",
             "голосніше",
@@ -28,6 +29,7 @@ pub fn match_fast_command(input: &str) -> Option<FastCommand> {
         &text,
         &[
             "зроби тихіше",
+            "зробити тихіше",
             "зменш гучність",
             "прибери гучність",
             "тихіше",
@@ -105,6 +107,14 @@ pub fn match_fast_command(input: &str) -> Option<FastCommand> {
         return command("open_app", json!({"app": app}), "Виконую, пане.");
     }
 
+    // Colloquial "давай Steam/Chrome" is safe only when the target resolves to
+    // a finite, known alias. Unknown nouns still fall through to the LLM.
+    if let Some(target) = strip_verb(&text, &["давай"])
+        && let Some(app) = known_app_alias(target)
+    {
+        return command("open_app", json!({"app": app}), "Виконую, пане.");
+    }
+
     if let Some(target) = strip_verb(
         &text,
         &["закрий", "закрити", "заверши", "зупини", "вимкни програму"],
@@ -146,7 +156,21 @@ fn normalize(input: &str) -> String {
             }
         })
         .collect();
-    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+    let fillers = [
+        "мені",
+        "будь",
+        "ласка",
+        "можеш",
+        "ну",
+        "джарвіс",
+        "джарвис",
+        "пане",
+    ];
+    cleaned
+        .split_whitespace()
+        .filter(|word| !fillers.contains(word))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn contains_complexity_marker(text: &str) -> bool {
@@ -229,20 +253,39 @@ fn app_alias(target: &str) -> Option<&str> {
     }
     Some(match target {
         "браузер" | "хром" | "google chrome" | "гугл хром" => "chrome",
-        "калькулятор" | "calculator" => "калькулятор",
-        "блокнот" | "notepad" => "блокнот",
-        "пейнт" | "паінт" | "paint" => "paint",
+        "калькулятор" | "калькулятер" | "calculator" => "калькулятор",
+        "блокнот" | "блакнот" | "notepad" => "блокнот",
+        "пейнт" | "паінт" | "пеінт" | "paint" => "paint",
         "провідник" | "проводник" | "explorer" => "провідник",
         "диспетчер завдань" | "диспетчер задач" => {
             "диспетчер завдань"
         }
         "командний рядок" | "cmd" => "cmd",
         "павершел" | "powershell" => "powershell",
-        "стім" | "steam" => "steam",
-        "діскорд" | "discord" => "discord",
-        "телеграм" | "telegram" => "telegram",
+        "стім" | "стим" | "steam" => "steam",
+        "діскорд" | "дискорд" | "discord" => "discord",
+        "телеграм" | "телеграмм" | "telegram" => "telegram",
         other => other,
     })
+}
+
+fn known_app_alias(target: &str) -> Option<&str> {
+    let alias = app_alias(target)?;
+    [
+        "chrome",
+        "калькулятор",
+        "блокнот",
+        "paint",
+        "провідник",
+        "диспетчер завдань",
+        "cmd",
+        "powershell",
+        "steam",
+        "discord",
+        "telegram",
+    ]
+    .contains(&alias)
+    .then_some(alias)
 }
 
 #[cfg(test)]
@@ -260,6 +303,13 @@ mod tests {
         assert_eq!(intent("Зроби тихіше"), Some("volume_down"));
         assert_eq!(intent("Вимкни звук"), Some("mute"));
         assert_eq!(intent("Закрий блокнот"), Some("close_app"));
+        assert_eq!(intent("відкрий мені ютуб"), Some("open_url"));
+        assert_eq!(intent("давай стім"), Some("open_app"));
+        assert_eq!(intent("можеш зробити тихіше"), Some("volume_down"));
+        assert_eq!(
+            intent("ну Джарвіс відкрий хром, будь ласка"),
+            Some("open_app")
+        );
     }
 
     #[test]
@@ -281,5 +331,6 @@ mod tests {
         assert_eq!(intent("відкрий браузер і знайди прогноз погоди"), None);
         assert_eq!(intent("що ти думаєш про калькулятор"), None);
         assert_eq!(intent("гучність дуже висока"), None);
+        assert_eq!(intent("давай невідому програму"), None);
     }
 }

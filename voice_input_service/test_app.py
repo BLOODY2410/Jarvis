@@ -22,6 +22,7 @@ from app import (
     pcm_to_wav,
     read_pcm_wav,
     next_event,
+    WAKE_FRAME_COUNT,
 )
 
 
@@ -45,15 +46,19 @@ class VoiceInputTests(unittest.TestCase):
         self.assertEqual(settings.vad_energy_delta, 0.004)
         self.assertEqual(settings.vad_start_chunks, 2)
         self.assertEqual(settings.vad_resume_chunks, 2)
-        self.assertEqual(settings.pre_roll_ms, 560)
-        self.assertEqual(settings.post_roll_ms, 480)
+        self.assertEqual(FRAME_MS, 20)
+        self.assertEqual(settings.profile, "production")
+        self.assertFalse(settings.diagnostic)
+        self.assertEqual(settings.pre_roll_ms, 480)
+        self.assertEqual(settings.post_roll_ms, 240)
         self.assertEqual(settings.silence_ms, 1200)
-        self.assertEqual(settings.fast_silence_ms, 560)
+        self.assertEqual(settings.fast_silence_ms, 440)
         self.assertEqual(settings.fast_whisper_model, "whisper-large-v3-turbo")
         self.assertEqual(settings.long_utterance_threshold_ms, 3000)
         self.assertEqual(settings.min_speech_ms, 300)
         self.assertEqual(settings.min_audio_rms, 0.0015)
-        self.assertEqual(settings.post_tts_guard_ms, 800)
+        self.assertEqual(settings.post_tts_guard_ms, 200)
+        self.assertEqual(settings.stt_response_format, "json")
         self.assertFalse(settings.barge_in_enabled)
         self.assertEqual(settings.wake_vosk_max_edit_distance, 1)
 
@@ -89,7 +94,8 @@ class VoiceInputTests(unittest.TestCase):
         engine._wake_model = Mock()
         engine._wake_model.models = {"hey_jarvis": object()}
         engine._wake_model.predict.return_value = {"hey_jarvis": 0.9}
-        engine.process_frame(np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes())
+        for _ in range(WAKE_FRAME_COUNT):
+            engine.process_frame(np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes())
         self.assertEqual(engine.events.get_nowait(), {"type": "wake"})
         self.assertTrue(engine.get_state()["conversation_active"])
 
@@ -125,9 +131,11 @@ class VoiceInputTests(unittest.TestCase):
         engine.set_state(True, True)
         speech = np.full(FRAME_SAMPLES, 12000, dtype=np.int16).tobytes()
         silence = np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes()
-        with patch.object(engine, "_is_speech", side_effect=[True, True, False, False]), \
+        silence_frames = frames_for_ms(engine.settings.silence_ms)
+        decisions = [True, True] + [False] * silence_frames
+        with patch.object(engine, "_is_speech", side_effect=decisions), \
              patch.object(engine, "_transcribe") as transcribe:
-            for frame in [speech, speech, silence, silence]:
+            for frame in [speech, speech] + [silence] * silence_frames:
                 engine.process_frame(frame)
             self.assertEqual(engine.events.get_nowait(), {"type": "interrupt"})
             for _ in range(20):
@@ -137,7 +145,7 @@ class VoiceInputTests(unittest.TestCase):
             self.assertTrue(transcribe.called)
 
     def test_vad_keeps_pre_roll_and_only_configured_post_roll(self):
-        settings = replace(test_settings(), pre_roll_ms=160, post_roll_ms=80)
+        settings = replace(test_settings(), pre_roll_ms=40, post_roll_ms=20, silence_ms=40, fast_silence_ms=40)
         engine = VoiceInputEngine(settings)
         engine.set_state(True, False)
         speech = np.full(FRAME_SAMPLES, 12000, dtype=np.int16).tobytes()
@@ -157,18 +165,20 @@ class VoiceInputTests(unittest.TestCase):
 
     def test_roll_intervals_round_up_instead_of_shortening(self):
         self.assertEqual(frames_for_ms(1), 1)
-        self.assertEqual(frames_for_ms(80), 1)
-        self.assertEqual(frames_for_ms(81), 2)
+        self.assertEqual(frames_for_ms(20), 1)
+        self.assertEqual(frames_for_ms(80), 4)
+        self.assertEqual(frames_for_ms(81), 5)
 
     def test_short_capture_uses_fast_adaptive_end_silence(self):
-        settings = replace(test_settings(), silence_ms=1200, fast_silence_ms=560)
+        settings = replace(test_settings(), silence_ms=1200, fast_silence_ms=440)
         engine = VoiceInputEngine(settings)
         engine.set_state(True, False)
         speech = np.full(FRAME_SAMPLES, 12000, dtype=np.int16).tobytes()
         silence = np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes()
-        with patch.object(engine, "_is_speech", side_effect=[True] + [False] * 7), \
+        silence_frames = frames_for_ms(settings.fast_silence_ms)
+        with patch.object(engine, "_is_speech", side_effect=[True] + [False] * silence_frames), \
              patch.object(engine, "_transcribe") as transcribe:
-            for frame in [speech] + [silence] * 7:
+            for frame in [speech] + [silence] * silence_frames:
                 engine.process_frame(frame)
             for _ in range(20):
                 if transcribe.called:
@@ -179,16 +189,16 @@ class VoiceInputTests(unittest.TestCase):
     def test_single_noise_spike_does_not_restart_end_silence_timer(self):
         settings = replace(
             test_settings(),
-            silence_ms=560,
-            fast_silence_ms=560,
+            silence_ms=100,
+            fast_silence_ms=100,
             vad_resume_chunks=2,
         )
         engine = VoiceInputEngine(settings)
         engine.set_state(True, False)
         speech = np.full(FRAME_SAMPLES, 12000, dtype=np.int16).tobytes()
         silence = np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes()
-        frames = [speech, silence, silence, silence, speech, silence, silence, silence]
-        decisions = [True, False, False, False, True, False, False, False]
+        frames = [speech, silence, silence, speech, silence, silence, silence, silence, silence]
+        decisions = [True, False, False, True, False, False, False, False, False]
         with patch.object(engine, "_is_speech", side_effect=decisions), \
              patch.object(engine, "_transcribe") as transcribe:
             for frame in frames:
@@ -205,7 +215,8 @@ class VoiceInputTests(unittest.TestCase):
         response = Mock()
         response.raise_for_status.return_value = None
         response.json.return_value = {"text": "Відкрий калькулятор"}
-        with patch("app.requests.post", return_value=response) as post:
+        response.elapsed.total_seconds.return_value = 0.05
+        with patch.object(engine._session, "post", return_value=response) as post:
             engine._transcribe([frame] * 5, [frame] * 5, 400)
         self.assertEqual(
             post.call_args.kwargs["data"]["model"],
@@ -216,6 +227,7 @@ class VoiceInputTests(unittest.TestCase):
         self.assertEqual(event["text"], "Відкрий калькулятор")
         self.assertIn("mic_end_unix_ms", event)
         self.assertIn("stt_done_unix_ms", event)
+        self.assertIn("stt_first_byte_unix_ms", event)
 
     def test_active_session_updates_noise_floor_below_gate_even_if_webrtc_says_speech(self):
         engine = VoiceInputEngine(test_settings())

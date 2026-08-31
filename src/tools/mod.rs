@@ -15,6 +15,7 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new() -> Self {
+        apps::warm_index();
         Self {
             schemas: vec![
                 tool(

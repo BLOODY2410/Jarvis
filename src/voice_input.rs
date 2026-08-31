@@ -19,6 +19,8 @@ pub enum VoiceEvent {
         #[serde(default)]
         mic_end_unix_ms: Option<u64>,
         #[serde(default)]
+        stt_first_byte_unix_ms: Option<u64>,
+        #[serde(default)]
         stt_done_unix_ms: Option<u64>,
     },
     Error {
