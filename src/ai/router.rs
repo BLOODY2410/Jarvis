@@ -300,11 +300,12 @@ impl AiRouter {
                         _ => {}
                     }
                     println!(
-                        "[AI Router] provider={} model={} status={:?} fallback={}",
+                        "[AI Router] provider={} model={} status={:?} fallback={} detail={}",
                         provider.kind(),
                         provider.model(),
                         error.kind,
-                        index + 1 < self.providers.len()
+                        index + 1 < self.providers.len(),
+                        error.safe_message
                     );
                     last_error = Some(error);
                 }
@@ -342,11 +343,6 @@ impl AiRouter {
             _ => return vec![],
         };
         let mut kinds = vec![primary];
-        if matches!(route, AiRoute::Conversation | AiRoute::Unknown)
-            && primary != ProviderKind::Cerebras
-        {
-            kinds.push(ProviderKind::Cerebras);
-        }
         if allow_fallbacks {
             kinds.extend(self.config.fallback_order.iter().copied());
         }
@@ -631,6 +627,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(gemini_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(groq_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn conversation_does_not_implicitly_call_pc_primary() {
+        let gemini_calls = Arc::new(AtomicUsize::new(0));
+        let cerebras_calls = Arc::new(AtomicUsize::new(0));
+        let groq_calls = Arc::new(AtomicUsize::new(0));
+        let providers: Vec<Arc<dyn AiProvider>> = vec![
+            Arc::new(Mock {
+                kind: ProviderKind::Gemini,
+                model: "smart".into(),
+                calls: gemini_calls.clone(),
+                failure: Some(AiErrorKind::Timeout),
+            }),
+            Arc::new(Mock {
+                kind: ProviderKind::Cerebras,
+                model: "pc".into(),
+                calls: cerebras_calls.clone(),
+                failure: Some(AiErrorKind::ProviderError),
+            }),
+            Arc::new(Mock {
+                kind: ProviderKind::Groq,
+                model: "qwen".into(),
+                calls: groq_calls.clone(),
+                failure: None,
+            }),
+        ];
+        let mut router = AiRouter::new(config(), providers);
+        let messages = vec![Message::user("Як справи?")];
+        router
+            .complete(AiRoute::Conversation, &messages, None, true, false)
+            .await
+            .unwrap();
+        assert_eq!(gemini_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cerebras_calls.load(Ordering::SeqCst), 0);
         assert_eq!(groq_calls.load(Ordering::SeqCst), 1);
     }
 }

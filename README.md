@@ -64,7 +64,7 @@ Screen Vision не реалізовано; `Vision` лишається заре�
 ```text
 Voice -> STT -> Fast/Safety Router -> AiRouter
                                   |-> Computer Agent: Cerebras -> Groq -> optional providers
-                                  |-> Conversation: Gemini -> Cerebras -> Groq -> optional providers
+                                  |-> Conversation: Gemini -> Groq -> optional providers
                                   `-> Live: Gemini 2.5 Flash + Google Search -> honest local guard
 ```
 

@@ -780,6 +780,15 @@ impl Agent {
             let content = message.content.clone();
 
             if tool_calls.is_empty() {
+                if (route == AiRoute::ComputerAgent || may_be_unrecognized_computer_action(input))
+                    && content
+                        .as_deref()
+                        .is_some_and(claims_completed_computer_action)
+                {
+                    return Ok(
+                        "Дію не підтверджено інструментом, сер. Повторіть команду.".to_owned()
+                    );
+                }
                 let mut answer = finalize_assistant_response(
                     input,
                     &content.unwrap_or_else(|| "Готово.".to_owned()),
@@ -972,6 +981,49 @@ fn looks_like_uncertain_computer_command(input: &str) -> bool {
     commandish
         .iter()
         .any(|verb| bounded_distance(first, verb, 2) <= 2)
+}
+
+fn claims_completed_computer_action(answer: &str) -> bool {
+    let text = normalize_for_guard(answer);
+    [
+        "відкрито",
+        "запущено",
+        "закрито",
+        "виконано",
+        "створено",
+        "переміщено",
+        "скопійовано",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+fn may_be_unrecognized_computer_action(input: &str) -> bool {
+    let text = normalize_for_guard(input);
+    if text.split_whitespace().count() > 5
+        || ["коли", "чому", "навіщо", "що таке", "розкажи"]
+            .iter()
+            .any(|marker| text.contains(marker))
+    {
+        return false;
+    }
+    [
+        "youtube",
+        "ютуб",
+        "chrome",
+        "хром",
+        "steam",
+        "стім",
+        "discord",
+        "дискорд",
+        "telegram",
+        "телеграм",
+        "браузер",
+        "калькулятор",
+        "блокнот",
+    ]
+    .iter()
+    .any(|target| text.contains(target))
 }
 
 fn bounded_distance(left: &str, right: &str, limit: usize) -> usize {
@@ -1371,9 +1423,10 @@ mod tests {
 
     use super::{
         EMERGENCY_SHUTDOWN_MESSAGE, LocalControl, NORMAL_SHUTDOWN_MESSAGE, PowerAction,
-        SYSTEM_PROMPT, VoiceState, clean_wake_word, context_window, fast_answer,
-        finalize_assistant_response, guarded_local_answer, listening_deadline,
-        looks_like_uncertain_computer_command, match_local_control, transition,
+        SYSTEM_PROMPT, VoiceState, claims_completed_computer_action, clean_wake_word,
+        context_window, fast_answer, finalize_assistant_response, guarded_local_answer,
+        listening_deadline, looks_like_uncertain_computer_command, match_local_control,
+        may_be_unrecognized_computer_action, transition,
     };
     use crate::core::fast_command::match_fast_command;
     use crate::core::messages::Message;
@@ -1402,6 +1455,18 @@ mod tests {
         );
         assert_eq!(command.acknowledgement, "YouTube відкрито.");
         assert_eq!(command.acknowledgement_cache, Some("opened"));
+    }
+
+    #[test]
+    fn unverified_action_claim_is_detected() {
+        assert!(claims_completed_computer_action("YouTube відкрито."));
+        assert!(!claims_completed_computer_action(
+            "Можу відкрити YouTube після уточнення."
+        ));
+        assert!(may_be_unrecognized_computer_action("Við foo YouTube"));
+        assert!(!may_be_unrecognized_computer_action(
+            "Коли було відкрито YouTube?"
+        ));
     }
 
     #[test]

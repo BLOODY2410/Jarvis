@@ -115,11 +115,18 @@ impl AiProvider for OpenAiCompatibleClient {
         if !status.is_success() {
             return Err(classify_http_error(status, retry_after));
         }
-        let data: ChatResponse = response.json().await.map_err(|_| {
-            AiError::new(
-                AiErrorKind::ProviderError,
-                "Провайдер AI повернув некоректну відповідь.",
-            )
+        let data: ChatResponse = response.json().await.map_err(|error| {
+            if error.is_timeout() {
+                AiError::new(
+                    AiErrorKind::Timeout,
+                    "Провайдер AI не завершив відповідь вчасно.",
+                )
+            } else {
+                AiError::new(
+                    AiErrorKind::ProviderError,
+                    "Провайдер AI повернув некоректну відповідь.",
+                )
+            }
         })?;
         let message = data
             .choices

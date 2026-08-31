@@ -182,6 +182,28 @@ pub fn match_fast_command(input: &str) -> Option<FastCommand> {
         );
     }
 
+    // Whisper can occasionally transliterate Ukrainian "відкрий" into a
+    // short Latin-looking phrase. Recover only finite, known-safe targets;
+    // never apply this correction to arbitrary programs or URLs.
+    if let Some(target) = strip_observed_transliterated_open(&text) {
+        if let Some(url) = website_url(target) {
+            return command(
+                "open_url",
+                json!({"url": url}),
+                website_opened_ack(url),
+                Some("opened"),
+            );
+        }
+        if let Some(app) = known_app_alias(target) {
+            return command(
+                "open_app",
+                json!({"app": app}),
+                app_opened_ack(app),
+                Some("opened"),
+            );
+        }
+    }
+
     if let Some(target) = strip_safe_fuzzy_verb(
         &text,
         &["відкрий", "відкрити", "запусти", "запустити", "включи"],
@@ -381,6 +403,14 @@ fn strip_safe_fuzzy_verb<'a>(text: &'a str, verbs: &[&str]) -> Option<&'a str> {
         .any(|verb| bounded_edit_distance(candidate, verb, allowed) <= allowed)
         .then(|| rest.trim())
         .filter(|rest| !rest.is_empty())
+}
+
+fn strip_observed_transliterated_open(text: &str) -> Option<&str> {
+    ["við grey ", "vid grey ", "vid grei ", "vidkryi "]
+        .iter()
+        .find_map(|prefix| text.strip_prefix(prefix))
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
 }
 
 fn bounded_edit_distance(left: &str, right: &str, limit: usize) -> usize {
@@ -721,6 +751,13 @@ mod tests {
         assert_eq!(intent("відкрийвізуалстудіокод"), Some("open_app"));
         assert_eq!(intent("відкрийбанкінг"), None);
         assert_eq!(intent("видалифайл"), None);
+    }
+
+    #[test]
+    fn observed_transliterated_open_only_matches_known_targets() {
+        assert_eq!(intent("Við grey YouTube."), Some("open_url"));
+        assert_eq!(intent("vid grey Steam"), Some("open_app"));
+        assert_eq!(intent("vid grey banking"), None);
     }
 
     #[test]

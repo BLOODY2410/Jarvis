@@ -90,9 +90,9 @@ impl Config {
                 .filter_map(ProviderKind::parse)
                 .collect(),
             ai_connect_timeout_ms: positive("JARVIS_AI_CONNECT_TIMEOUT_MS", 2500),
-            ai_read_timeout_ms: positive("JARVIS_AI_READ_TIMEOUT_MS", 12000),
+            ai_read_timeout_ms: positive("JARVIS_AI_READ_TIMEOUT_MS", 6000),
             ai_rate_limit_cooldown_secs: positive("JARVIS_AI_RATE_LIMIT_COOLDOWN_SECS", 30),
-            ai_timeout_cooldown_secs: positive("JARVIS_AI_TIMEOUT_COOLDOWN_SECS", 10),
+            ai_timeout_cooldown_secs: positive("JARVIS_AI_TIMEOUT_COOLDOWN_SECS", 60),
             ai_circuit_failures: positive("JARVIS_AI_CIRCUIT_FAILURES", 2),
             ai_max_retries: env::var("JARVIS_AI_MAX_RETRIES")
                 .ok()

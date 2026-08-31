@@ -107,7 +107,7 @@ impl AiProvider for GeminiClient {
         let mut body = json!({
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": contents,
-            "generationConfig": {"temperature": request.temperature, "maxOutputTokens": request.max_output_tokens}
+            "generationConfig": {"maxOutputTokens": request.max_output_tokens}
         });
         if request.live_search {
             body["tools"] = json!([{"google_search": {}}]);
@@ -131,11 +131,15 @@ impl AiProvider for GeminiClient {
         if !status.is_success() {
             return Err(classify_http_error(status, None));
         }
-        let data: GeminiResponse = response.json().await.map_err(|_| {
-            AiError::new(
-                AiErrorKind::ProviderError,
-                "Gemini повернув некоректну відповідь.",
-            )
+        let data: GeminiResponse = response.json().await.map_err(|error| {
+            if error.is_timeout() {
+                AiError::new(AiErrorKind::Timeout, "Gemini не завершив відповідь вчасно.")
+            } else {
+                AiError::new(
+                    AiErrorKind::ProviderError,
+                    "Gemini повернув некоректну відповідь.",
+                )
+            }
         })?;
         let candidate = data
             .candidates
