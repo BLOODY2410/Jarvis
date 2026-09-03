@@ -1,4 +1,69 @@
-# JARVIS Desktop Core
+# JARVIS v2 — Python-first Desktop Assistant
+
+JARVIS v2 is now the default launcher. It runs microphone/VAD/STT, AI routing, validated Windows tools, Fish/Piper TTS, memory, and playback in one Python 3.12 process. The legacy Rust core remains in the repository and is still runnable during acceptance testing.
+
+```text
+Microphone -> VAD -> Groq Whisper primary/fallback -> Pydantic intent
+                                                   |-> deterministic Fast Path -> validated Windows tool
+                                                   |-> PC Agent tool loop
+                                                   |-> conversation
+                                                   |-> Gemini Search -> Groq Compound Mini
+                                                   `-> screenshot -> vision
+                                                          |
+                                                   Fish TTS -> Piper fallback -> speaker
+```
+
+## Quick start
+
+```powershell
+cd D:\Jarvis
+.\install.ps1
+.\test.ps1
+.\start.ps1
+```
+
+Useful commands:
+
+```powershell
+.\status.ps1
+.\stop.ps1
+.\benchmark-v2.ps1
+.\.venv\Scripts\python.exe -m jarvis_v2 --text "постав гучність на 30"
+.\.venv\Scripts\python.exe -m jarvis_v2 --doctor
+```
+
+`--doctor` is secret-safe and makes no cloud request. It reports configured provider names, whether voice/TTS are enabled, and confirms that v2 uses no localhost sidecars.
+
+## Reliability rules
+
+- Fast commands never wait for an LLM.
+- Semantic actions must validate as a discriminated Pydantic intent with sufficient confidence.
+- Tool calls are validated against strict schemas immediately before execution.
+- Only a successful `ToolResult` can produce an action acknowledgement; model text is never evidence of success.
+- Live answers require returned provenance URLs. Without sources, JARVIS explicitly refuses to present the answer as current.
+- Provider calls use short timeouts, fallback chains, and circuit breakers.
+- Voice budgeting keeps whole sentences; it never truncates in the middle of a sentence.
+- “сер” is sparse and cannot appear in consecutive short replies.
+
+## Voice and language
+
+The default STT mode is automatic multilingual recognition for Ukrainian, Russian, and surzhyk. Short speech uses Groq `whisper-large-v3-turbo`; longer audio or a failed primary attempt falls back to `whisper-large-v3`. Add names and application vocabulary through `JARVIS_CUSTOM_VOCABULARY`.
+
+Fish Audio and Piper behavior is preserved, but both are called directly inside the process. v2 does not listen on ports 8765/8766 and therefore avoids sidecar startup races and stale-port reuse.
+
+## Providers
+
+All keys are optional individually; a route uses the configured providers in its chain. The implementation follows the official Python SDK/API contracts for [Gemini and Google Search grounding](https://ai.google.dev/gemini-api/docs/get-started), [Groq local tool calling](https://console.groq.com/docs/tool-use/local-tool-calling), [Groq speech-to-text](https://console.groq.com/docs/speech-to-text), [Groq Compound](https://console.groq.com/docs/compound), [Cerebras tool calling](https://inference-docs.cerebras.ai/capabilities/tool-use), [Cerebras structured output](https://inference-docs.cerebras.ai/capabilities/structured-outputs), [Mistral SDK](https://docs.mistral.ai/resources/sdks), and [OpenRouter Python SDK](https://openrouter.ai/docs/client-sdks/python/overview).
+
+Cloud tests are mock/contract tests unless explicitly run with real keys. The project never labels a mocked test as a successful live call.
+
+See [MIGRATION.md](MIGRATION.md) for provider chains, rollback, and the acceptance checklist.
+
+## Legacy Rust core
+
+The rest of this document describes the preserved v1 implementation. Use `start-legacy.ps1`, `status-legacy.ps1`, and `stop-legacy.ps1` while comparing behavior.
+
+# JARVIS Desktop Core (legacy v1)
 
 Надійний режим для Windows зараз працює так:
 

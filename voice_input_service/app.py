@@ -114,7 +114,7 @@ class Settings:
         return cls(
             groq_api_key=os.getenv("GROQ_API_KEY", "").strip(),
             whisper_model=os.getenv("JARVIS_WHISPER_MODEL", "whisper-large-v3"),
-            language=os.getenv("JARVIS_STT_LANGUAGE", "uk"),
+            language=os.getenv("JARVIS_STT_LANGUAGE", "auto"),
             device=device,
             wake_threshold=env_float("JARVIS_WAKE_THRESHOLD", 0.45),
             vad_aggressiveness=int(env_float("JARVIS_VAD_AGGRESSIVENESS", 1)),
@@ -886,11 +886,12 @@ class VoiceInputEngine:
                     request_started_unix_ms = int(time.time() * 1_000)
                     data = {
                         "model": model,
-                        "language": self.settings.language,
                         "response_format": self.settings.stt_response_format,
                         "temperature": "0",
                         "prompt": self.settings.stt_prompt,
                     }
+                    if self.settings.language.lower() not in {"", "auto", "mixed", "uk-ru"}:
+                        data["language"] = self.settings.language
                     if self.settings.stt_response_format == "verbose_json":
                         data["timestamp_granularities[]"] = "segment"
                     response = self._session.post(
