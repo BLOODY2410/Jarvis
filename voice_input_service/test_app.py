@@ -28,8 +28,20 @@ from app import (
 
 def test_settings() -> Settings:
     return Settings(
-        "key", "whisper-large-v3", "uk", None, 0.45, 2, 160, 20, 2,
-        True, 200, 0.001, 0, "Українська команда",
+        "key",
+        "whisper-large-v3",
+        "uk",
+        None,
+        0.45,
+        2,
+        160,
+        20,
+        2,
+        True,
+        200,
+        0.001,
+        0,
+        "Українська команда",
     )
 
 
@@ -62,6 +74,16 @@ class VoiceInputTests(unittest.TestCase):
         self.assertFalse(settings.barge_in_enabled)
         self.assertEqual(settings.wake_vosk_max_edit_distance, 1)
         self.assertEqual(settings.activation_mode, "hybrid")
+        self.assertEqual(settings.input_latency_secs, 0.2)
+
+    def test_microphone_latency_is_configurable_and_safely_bounded(self):
+        with patch.dict(
+            os.environ,
+            {"GROQ_API_KEY": "key", "JARVIS_MIC_LATENCY_MS": "2500"},
+            clear=True,
+        ):
+            settings = Settings.from_environment()
+        self.assertEqual(settings.input_latency_secs, 1.0)
 
     def test_deactivation_drops_stale_events(self):
         engine = VoiceInputEngine(test_settings())
@@ -108,8 +130,10 @@ class VoiceInputTests(unittest.TestCase):
 
     def test_hybrid_wake_backend_failure_does_not_break_hotkey_fallback(self):
         engine = VoiceInputEngine(replace(test_settings(), activation_mode="hybrid"))
-        with patch.object(engine, "_load_wake_model", side_effect=RuntimeError("offline")), \
-             patch.object(engine, "_load_ukrainian_wake_model", side_effect=RuntimeError("offline")):
+        with (
+            patch.object(engine, "_load_wake_model", side_effect=RuntimeError("offline")),
+            patch.object(engine, "_load_ukrainian_wake_model", side_effect=RuntimeError("offline")),
+        ):
             engine._load_wake_backends()
         self.assertEqual(
             engine.get_state()["wake_backends"]["errors"],
@@ -152,8 +176,10 @@ class VoiceInputTests(unittest.TestCase):
         silence = np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes()
         silence_frames = frames_for_ms(engine.settings.silence_ms)
         decisions = [True, True] + [False] * silence_frames
-        with patch.object(engine, "_is_speech", side_effect=decisions), \
-             patch.object(engine, "_transcribe") as transcribe:
+        with (
+            patch.object(engine, "_is_speech", side_effect=decisions),
+            patch.object(engine, "_transcribe") as transcribe,
+        ):
             for frame in [speech, speech] + [silence] * silence_frames:
                 engine.process_frame(frame)
             self.assertEqual(engine.events.get_nowait(), {"type": "interrupt"})
@@ -179,13 +205,17 @@ class VoiceInputTests(unittest.TestCase):
         self.assertEqual(engine.events.get_nowait(), {"type": "listening"})
 
     def test_vad_keeps_pre_roll_and_only_configured_post_roll(self):
-        settings = replace(test_settings(), pre_roll_ms=40, post_roll_ms=20, silence_ms=40, fast_silence_ms=40)
+        settings = replace(
+            test_settings(), pre_roll_ms=40, post_roll_ms=20, silence_ms=40, fast_silence_ms=40
+        )
         engine = VoiceInputEngine(settings)
         engine.set_state(True, False)
         speech = np.full(FRAME_SAMPLES, 12000, dtype=np.int16).tobytes()
         silence = np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes()
-        with patch.object(engine, "_is_speech", side_effect=[False, False, True, True, False, False]), \
-             patch.object(engine, "_transcribe") as transcribe:
+        with (
+            patch.object(engine, "_is_speech", side_effect=[False, False, True, True, False, False]),
+            patch.object(engine, "_transcribe") as transcribe,
+        ):
             for frame in [silence, silence, speech, speech, silence, silence]:
                 engine.process_frame(frame)
             for _ in range(20):
@@ -210,8 +240,10 @@ class VoiceInputTests(unittest.TestCase):
         speech = np.full(FRAME_SAMPLES, 12000, dtype=np.int16).tobytes()
         silence = np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes()
         silence_frames = frames_for_ms(settings.fast_silence_ms)
-        with patch.object(engine, "_is_speech", side_effect=[True] + [False] * silence_frames), \
-             patch.object(engine, "_transcribe") as transcribe:
+        with (
+            patch.object(engine, "_is_speech", side_effect=[True] + [False] * silence_frames),
+            patch.object(engine, "_transcribe") as transcribe,
+        ):
             for frame in [speech] + [silence] * silence_frames:
                 engine.process_frame(frame)
             for _ in range(20):
@@ -233,8 +265,10 @@ class VoiceInputTests(unittest.TestCase):
         silence = np.zeros(FRAME_SAMPLES, dtype=np.int16).tobytes()
         frames = [speech, silence, silence, speech, silence, silence, silence, silence, silence]
         decisions = [True, False, False, True, False, False, False, False, False]
-        with patch.object(engine, "_is_speech", side_effect=decisions), \
-             patch.object(engine, "_transcribe") as transcribe:
+        with (
+            patch.object(engine, "_is_speech", side_effect=decisions),
+            patch.object(engine, "_transcribe") as transcribe,
+        ):
             for frame in frames:
                 engine.process_frame(frame)
             for _ in range(20):
@@ -294,8 +328,10 @@ class VoiceInputTests(unittest.TestCase):
         engine._noise_history.extend([0.10] * 100)
         engine.set_state(True, False)
         stationary_noise = np.full(FRAME_SAMPLES, 3277, dtype=np.int16).tobytes()
-        with patch.object(engine, "_is_speech", return_value=True), \
-             patch.object(engine, "_transcribe") as transcribe:
+        with (
+            patch.object(engine, "_is_speech", return_value=True),
+            patch.object(engine, "_transcribe") as transcribe,
+        ):
             for _ in range(30):
                 engine.process_frame(stationary_noise)
             self.assertFalse(engine._speech_seen)

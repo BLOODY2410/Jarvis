@@ -17,3 +17,10 @@ voice_service/models/*.onnx
 voice_service/models/*.json
 voice_service/models/*.download
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.run/
+*.db
+__pycache__/

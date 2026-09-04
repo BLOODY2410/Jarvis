@@ -30,7 +30,9 @@ from pydantic import BaseModel
 
 SERVICE_ROOT = Path(__file__).resolve().parent
 load_dotenv(SERVICE_ROOT.parent / ".env")
-_default_log_level = "DEBUG" if os.getenv("JARVIS_PROFILE", "production").strip().lower() == "debug" else "WARNING"
+_default_log_level = (
+    "DEBUG" if os.getenv("JARVIS_PROFILE", "production").strip().lower() == "debug" else "WARNING"
+)
 logging.basicConfig(level=os.getenv("JARVIS_INPUT_LOG_LEVEL", _default_log_level))
 LOGGER = logging.getLogger("jarvis.voice_input")
 
@@ -101,6 +103,7 @@ class Settings:
     long_utterance_threshold_ms: int = 3_000
     fast_stt_max_speech_ms: int = 3_500
     vad_resume_chunks: int = 2
+    input_latency_secs: float = 0.2
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -114,7 +117,7 @@ class Settings:
         return cls(
             groq_api_key=os.getenv("GROQ_API_KEY", "").strip(),
             whisper_model=os.getenv("JARVIS_WHISPER_MODEL", "whisper-large-v3"),
-            language=os.getenv("JARVIS_STT_LANGUAGE", "uk"),
+            language=os.getenv("JARVIS_STT_LANGUAGE", "auto"),
             device=device,
             wake_threshold=env_float("JARVIS_WAKE_THRESHOLD", 0.45),
             vad_aggressiveness=int(env_float("JARVIS_VAD_AGGRESSIVENESS", 1)),
@@ -135,7 +138,9 @@ class Settings:
             level_log_interval_ms=max(100, int(env_float("JARVIS_LEVEL_LOG_INTERVAL_MS", 1_000))),
             pre_roll_ms=max(FRAME_MS, int(env_float("JARVIS_PRE_ROLL_MS", 480))),
             post_roll_ms=max(0, int(env_float("JARVIS_POST_ROLL_MS", 240))),
-            diagnostic_dir=Path(os.getenv("JARVIS_DIAGNOSTIC_DIR", str(SERVICE_ROOT / "diagnostics"))).resolve(),
+            diagnostic_dir=Path(
+                os.getenv("JARVIS_DIAGNOSTIC_DIR", str(SERVICE_ROOT / "diagnostics"))
+            ).resolve(),
             stt_response_format=os.getenv("JARVIS_STT_RESPONSE_FORMAT", "json").strip() or "json",
             wake_variants=tuple(
                 item.strip()
@@ -151,19 +156,18 @@ class Settings:
             vad_start_chunks=max(1, int(env_float("JARVIS_VAD_START_CHUNKS", 2))),
             activation_mode=os.getenv("JARVIS_ACTIVATION_MODE", "hybrid").strip().lower(),
             hotkey_enabled=env_bool("JARVIS_HOTKEY_ENABLED", True),
-            fast_whisper_model=os.getenv(
-                "JARVIS_FAST_WHISPER_MODEL", "whisper-large-v3-turbo"
-            ).strip() or "whisper-large-v3-turbo",
-            fast_silence_ms=max(
-                400, min(600, int(env_float("JARVIS_FAST_END_SILENCE_MS", 440)))
-            ),
+            fast_whisper_model=os.getenv("JARVIS_FAST_WHISPER_MODEL", "whisper-large-v3-turbo").strip()
+            or "whisper-large-v3-turbo",
+            fast_silence_ms=max(400, min(600, int(env_float("JARVIS_FAST_END_SILENCE_MS", 440)))),
             long_utterance_threshold_ms=max(
                 1_000, int(env_float("JARVIS_LONG_UTTERANCE_THRESHOLD_MS", 3_000))
             ),
-            fast_stt_max_speech_ms=max(
-                500, int(env_float("JARVIS_FAST_STT_MAX_SPEECH_MS", 3_500))
-            ),
+            fast_stt_max_speech_ms=max(500, int(env_float("JARVIS_FAST_STT_MAX_SPEECH_MS", 3_500))),
             vad_resume_chunks=max(1, int(env_float("JARVIS_VAD_RESUME_CHUNKS", 2))),
+            input_latency_secs=max(
+                0.05,
+                min(1.0, env_float("JARVIS_MIC_LATENCY_MS", 200) / 1_000),
+            ),
         )
 
 
@@ -221,6 +225,8 @@ class VoiceInputEngine:
         self._wake_loader_thread: threading.Thread | None = None
         self._wake_backend_errors: list[str] = []
         self._last_mic_end_unix_ms: int | None = None
+        self._input_overflows = 0
+        self._last_overflow_warning = 0.0
         self._wake_frames: deque[bytes] = deque(maxlen=WAKE_FRAME_COUNT)
         self._session = requests.Session()
 
@@ -286,7 +292,9 @@ class VoiceInputEngine:
             was_speaking = self._speaking
             self._conversation_active = conversation_active
             self._speaking = speaking
-            self._transition("SPEAKING" if speaking else ("LISTENING" if conversation_active else "IDLE"), "rust_state")
+            self._transition(
+                "SPEAKING" if speaking else ("LISTENING" if conversation_active else "IDLE"), "rust_state"
+            )
             if was_speaking and not speaking:
                 self._ignore_until = time.monotonic() + self.settings.post_tts_guard_ms / 1_000
                 self._reset_capture()
@@ -328,6 +336,7 @@ class VoiceInputEngine:
                 "noise_floor_rms": round(self._noise_floor(), 6),
                 "energy_gate_rms": round(self._energy_threshold(), 6),
                 "last_transcript": self._last_transcript,
+                "input_overflows": self._input_overflows,
                 "recent_level_window": level_window,
                 "wake_backends": {
                     "openwakeword": self._wake_model is not None,
@@ -375,7 +384,11 @@ class VoiceInputEngine:
         try:
             self._device = self._select_device(devices)
             selected = sd.query_devices(self._device, "input")
-            selected_index = int(self._device) if isinstance(self._device, int) else self._resolve_selected_device_index(selected)
+            selected_index = (
+                int(self._device)
+                if isinstance(self._device, int)
+                else self._resolve_selected_device_index(selected)
+            )
             self._selected_device = {
                 "requested": self.settings.device if self.settings.device is not None else "auto",
                 "index": selected_index,
@@ -409,16 +422,14 @@ class VoiceInputEngine:
             return int(matches[0]["index"])
 
         blocked = ("stereo mix", "loopback", "what u hear", "output", "мікшер", "стерео")
-        safe = [
-            item for item in devices
-            if not any(word in str(item["name"]).casefold() for word in blocked)
-        ]
+        safe = [item for item in devices if not any(word in str(item["name"]).casefold() for word in blocked)]
         default = next((item for item in safe if item["is_default"]), None)
         if default is not None:
             return int(default["index"])
         preferred = next(
             (
-                item for item in safe
+                item
+                for item in safe
                 if any(word in str(item["name"]).casefold() for word in ("microphone", "mic", "мікрофон"))
             ),
             None,
@@ -518,7 +529,11 @@ class VoiceInputEngine:
         with self._lock:
             self._wake_backend_errors = errors
         if self._wake_model is None and self._vosk_recognizer is None:
-            fallback = "Ctrl+Alt+J remains active" if self.settings.activation_mode == "hybrid" else "POST /activate remains available"
+            fallback = (
+                "Ctrl+Alt+J remains active"
+                if self.settings.activation_mode == "hybrid"
+                else "POST /activate remains available"
+            )
             LOGGER.warning("Wake phrase unavailable; %s", fallback)
 
     def _load_ukrainian_wake_model(self) -> None:
@@ -557,6 +572,7 @@ class VoiceInputEngine:
                 device=self._device,
                 dtype="int16",
                 channels=1,
+                latency=self.settings.input_latency_secs,
             ) as stream:
                 LOGGER.info(
                     "Microphone stream opened: sample_rate=%s Hz channels=%s chunk=%s samples (%d ms); activation=%s",
@@ -569,7 +585,16 @@ class VoiceInputEngine:
                 while not self._stop.is_set():
                     frame, overflowed = stream.read(FRAME_SAMPLES)
                     if overflowed:
-                        LOGGER.warning("Microphone input overflow")
+                        self._input_overflows += 1
+                        now = time.monotonic()
+                        if self._input_overflows == 1:
+                            LOGGER.info("Microphone input buffer recovered from a transient overflow")
+                        elif now - self._last_overflow_warning >= 5:
+                            LOGGER.warning(
+                                "Repeated microphone input overflows; audio may be missing (count=%d)",
+                                self._input_overflows,
+                            )
+                            self._last_overflow_warning = now
                     self.process_frame(bytes(frame))
         except Exception as error:
             LOGGER.exception("Microphone loop stopped")
@@ -615,7 +640,9 @@ class VoiceInputEngine:
                             self._wake_model = None
                         with self._lock:
                             self._wake_backend_errors.append(f"openwakeword_runtime:{type(error).__name__}")
-                        LOGGER.warning("openWakeWord disabled after runtime failure (%s)", type(error).__name__)
+                        LOGGER.warning(
+                            "openWakeWord disabled after runtime failure (%s)", type(error).__name__
+                        )
             else:
                 self._wake_frames.clear()
             if score is not None:
@@ -684,10 +711,7 @@ class VoiceInputEngine:
         else:
             if candidate_speech:
                 self._vad_resume_run += 1
-                speech = (
-                    self._silence_chunks == 0
-                    or self._vad_resume_run >= self.settings.vad_resume_chunks
-                )
+                speech = self._silence_chunks == 0 or self._vad_resume_run >= self.settings.vad_resume_chunks
             else:
                 self._vad_resume_run = 0
                 speech = False
@@ -720,7 +744,11 @@ class VoiceInputEngine:
                     energy_threshold,
                 )
             self._speech_seen = True
-            if speaking and not self._interrupt_sent and self._consecutive_speech_chunks >= self.settings.barge_in_chunks:
+            if (
+                speaking
+                and not self._interrupt_sent
+                and self._consecutive_speech_chunks >= self.settings.barge_in_chunks
+            ):
                 self._interrupt_sent = True
                 LOGGER.info("Barge-in detected")
                 self._emit({"type": "interrupt"})
@@ -789,7 +817,9 @@ class VoiceInputEngine:
         self._last_level_log = now
         wake_detail = ""
         if wake_score is not None:
-            wake_detail = f" wake_score={wake_score:.3f}/{self.settings.wake_threshold:.3f} vosk={wake_text!r}"
+            wake_detail = (
+                f" wake_score={wake_score:.3f}/{self.settings.wake_threshold:.3f} vosk={wake_text!r}"
+            )
         LOGGER.info(
             "INPUT level: RMS=%.4f (%.1f dBFS) peak=%.4f (%.1f dBFS) VAD=%s%s",
             rms,
@@ -886,11 +916,12 @@ class VoiceInputEngine:
                     request_started_unix_ms = int(time.time() * 1_000)
                     data = {
                         "model": model,
-                        "language": self.settings.language,
                         "response_format": self.settings.stt_response_format,
                         "temperature": "0",
                         "prompt": self.settings.stt_prompt,
                     }
+                    if self.settings.language.lower() not in {"", "auto", "mixed", "uk-ru"}:
+                        data["language"] = self.settings.language
                     if self.settings.stt_response_format == "verbose_json":
                         data["timestamp_granularities[]"] = "segment"
                     response = self._session.post(
@@ -901,7 +932,9 @@ class VoiceInputEngine:
                         stream=True,
                         timeout=(2.5, 15),
                     )
-                    stt_first_byte_unix_ms = request_started_unix_ms + int(response.elapsed.total_seconds() * 1_000)
+                    stt_first_byte_unix_ms = request_started_unix_ms + int(
+                        response.elapsed.total_seconds() * 1_000
+                    )
                     response.raise_for_status()
                     selected_model = model
                     break
@@ -931,17 +964,21 @@ class VoiceInputEngine:
             }
             LOGGER.info("Whisper transcript EXACT: %r", text)
             if self.settings.diagnostic:
-                LOGGER.info("Whisper metadata: %s", json.dumps(metadata, ensure_ascii=False, separators=(",", ":")))
+                LOGGER.info(
+                    "Whisper metadata: %s", json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+                )
             if rejected_reason:
                 LOGGER.warning("Transcript rejected: %s", rejected_reason)
             elif text:
-                self._emit({
-                    "type": "transcript",
-                    "text": text,
-                    "mic_end_unix_ms": self._last_mic_end_unix_ms,
-                    "stt_first_byte_unix_ms": stt_first_byte_unix_ms,
-                    "stt_done_unix_ms": stt_done_unix_ms,
-                })
+                self._emit(
+                    {
+                        "type": "transcript",
+                        "text": text,
+                        "mic_end_unix_ms": self._last_mic_end_unix_ms,
+                        "stt_first_byte_unix_ms": stt_first_byte_unix_ms,
+                        "stt_done_unix_ms": stt_done_unix_ms,
+                    }
+                )
                 terminal_event_emitted = True
         except Exception as error:
             LOGGER.exception("Groq Whisper request failed")
@@ -973,7 +1010,9 @@ class VoiceInputEngine:
         raw_path.write_bytes(pcm_to_wav(raw_pcm))
         if whisper_pcm is None:
             whisper_path.unlink(missing_ok=True)
-            LOGGER.info("Diagnostic WAV saved: raw=%s; Whisper WAV not created (audio was filtered)", raw_path)
+            LOGGER.info(
+                "Diagnostic WAV saved: raw=%s; Whisper WAV not created (audio was filtered)", raw_path
+            )
             return
         whisper_path.write_bytes(pcm_to_wav(whisper_pcm))
         self._utterance_number += 1
@@ -999,7 +1038,7 @@ class VoiceInputEngine:
             if self._vosk_recognizer is not None:
                 self._vosk_recognizer.Reset()
             for offset in range(0, len(pcm), FRAME_SAMPLES * 2):
-                frame = pcm[offset:offset + FRAME_SAMPLES * 2]
+                frame = pcm[offset : offset + FRAME_SAMPLES * 2]
                 if len(frame) < FRAME_SAMPLES * 2:
                     frame += b"\0" * (FRAME_SAMPLES * 2 - len(frame))
                 samples = np.frombuffer(frame, dtype=np.int16)
