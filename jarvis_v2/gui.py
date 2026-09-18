@@ -87,6 +87,7 @@ class JarvisWindow:
         self.wake_word = StringVar(value="джарвіс")
         self.fallback = BooleanVar(value=True)
         self.debug = BooleanVar(value=False)
+        self._launching = False
         self._build()
         self._load()
         self._refresh()
@@ -117,7 +118,8 @@ class JarvisWindow:
         ttk.Label(frame, textvariable=self.status, style="Status.TLabel").grid(row=2, column=0, sticky="w", pady=(0, 14))
         buttons = ttk.Frame(frame)
         buttons.grid(row=3, column=0, sticky="ew", pady=(0, 20))
-        ttk.Button(buttons, text="Запустити JARVIS", command=self.start).pack(side="left")
+        self.start_button = ttk.Button(buttons, text="Запустити JARVIS", command=self.start)
+        self.start_button.pack(side="left")
         ttk.Button(buttons, text="Зупинити", command=self.stop).pack(side="left", padx=8)
         ttk.Button(buttons, text="Відкрити журнал", command=self.open_log).pack(side="right")
         settings = ttk.LabelFrame(frame, text="Налаштування", padding=14)
@@ -202,13 +204,15 @@ class JarvisWindow:
             self.status.set("Налаштування збережено. Вони застосуються під час наступного запуску.")
 
     def start(self) -> None:
-        if runtime_pid(self.project):
+        if self._launching or runtime_pid(self.project):
             self.status.set("JARVIS уже працює.")
             return
         if not self.gemini_key.get().strip():
             messagebox.showwarning(APP_TITLE, "Додайте Gemini API key у налаштуваннях перед запуском.")
             return
         self.save(quiet=True)
+        self._launching = True
+        self.start_button.state(["disabled"])
         self.status.set("Підготовка JARVIS…")
         threading.Thread(target=self._start_worker, daemon=True).start()
 
@@ -230,9 +234,14 @@ class JarvisWindow:
                 )
         except (OSError, subprocess.CalledProcessError) as error:
             message = f"Не вдалося запустити: {error}"
-            self.root.after(0, lambda: self.status.set(message))
+            self.root.after(0, lambda: self._startup_failed(message))
             return
         self.root.after(1200, self._refresh)
+
+    def _startup_failed(self, message: str) -> None:
+        self._launching = False
+        self.start_button.state(["!disabled"])
+        self.status.set(message)
 
     def stop(self) -> None:
         self.status.set("Зупиняю JARVIS…")
@@ -259,7 +268,14 @@ class JarvisWindow:
 
     def _refresh(self) -> None:
         pid = runtime_pid(self.project)
-        self.status.set(f"JARVIS працює · PID {pid}" if pid else "JARVIS зупинено")
+        if pid:
+            self._launching = False
+            self.start_button.state(["disabled"])
+            self.status.set(f"JARVIS працює · PID {pid}")
+        else:
+            self._launching = False
+            self.start_button.state(["!disabled"])
+            self.status.set("JARVIS зупинено")
         self.root.after(1500, self._refresh)
 
 
