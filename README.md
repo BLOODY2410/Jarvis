@@ -29,7 +29,7 @@ For a simple launcher and settings window, build `JARVIS.exe` once:
 .\build-gui.ps1
 ```
 
-Open `dist\JARVIS.exe`. It is a standalone Windows application: enter the Gemini key in its settings and it stores `.env`, logs and memory next to the executable. It starts the same one-process runtime without localhost sidecars or a terminal.
+Open `dist\JARVIS\JARVIS.exe` and keep the whole `JARVIS` folder together. It is a standalone Windows application: enter the Gemini key in its settings and it stores `.env`, logs and memory next to the executable. It starts the same one-process runtime without localhost sidecars, a terminal, or temporary self-extracting files.
 
 Fish is optional and deliberately excluded from the normal installation because its dependency stack is large. To use `JARVIS_VOICE_MODE=fish`, install and run with its extra:
 
