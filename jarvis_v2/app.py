@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import json
 import os
 import time
@@ -21,20 +22,50 @@ from jarvis_v2.voice import InProcessVoiceRuntime
 class ProcessLock:
     def __init__(self, root: Path) -> None:
         self.path = root / ".run" / "jarvis-v2.pid"
+        self._mutex: int | None = None
+
+    def _acquire_windows_mutex(self) -> None:
+        if os.name != "nt":
+            return
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.CreateMutexW(None, False, "Local\\JARVIS_v2_runtime")
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "CreateMutexW failed")
+        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+            kernel32.CloseHandle(handle)
+            raise RuntimeError("JARVIS v2 is already running.")
+        self._mutex = int(handle)
 
     def acquire(self) -> None:
+        self._acquire_windows_mutex()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
-            try:
-                pid = int(self.path.read_text(encoding="ascii").strip())
-                os.kill(pid, 0)
-            except (ValueError, OSError):
-                self.path.unlink(missing_ok=True)
-            else:
-                raise RuntimeError(f"JARVIS v2 already runs as PID {pid}")
-        temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(str(os.getpid()), encoding="ascii")
-        temporary.replace(self.path)
+        try:
+            for attempt in range(2):
+                try:
+                    descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                except FileExistsError:
+                    running_pid = "unknown"
+                    try:
+                        running_pid = self.path.read_text(encoding="ascii").strip()
+                        os.kill(int(running_pid), 0)
+                    except (ValueError, OSError):
+                        if attempt == 0:
+                            self.path.unlink(missing_ok=True)
+                            continue
+                    raise RuntimeError(f"JARVIS v2 already runs as PID {running_pid}") from None
+                else:
+                    with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+                        handle.write(str(os.getpid()))
+                    return
+            raise RuntimeError("Could not acquire the JARVIS process lock.")
+        except Exception:
+            self._release_windows_mutex()
+            raise
+
+    def _release_windows_mutex(self) -> None:
+        if self._mutex is not None:
+            ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(self._mutex)
+            self._mutex = None
 
     def release(self) -> None:
         try:
@@ -42,6 +73,7 @@ class ProcessLock:
                 self.path.unlink()
         except OSError:
             pass
+        self._release_windows_mutex()
 
 
 def build_agent(settings: Settings) -> JarvisAgent:
@@ -62,11 +94,11 @@ async def run_voice(agent: JarvisAgent, settings: Settings) -> int:
     live: GeminiLiveSession | None = None
     try:
         await runtime.start()
-        print("JARVIS v2")
-        print(f"Gemini 3.8 Live: {'available' if settings.gemini_api_key else 'not configured'}")
-        print(f"Extended Thinking: {'available' if settings.gemini_api_key else 'not configured'}")
-        print(f"Groq fallback: {'available' if settings.groq_api_key and settings.fallback_enabled else 'not configured'}")
-        print("JARVIS online. Скажіть «Джарвіс» або натисніть Ctrl+Alt+J. Ctrl+C — вихід.")
+        print("JARVIS v2", flush=True)
+        print(f"Gemini 3.8 Live: {'available' if settings.gemini_api_key else 'not configured'}", flush=True)
+        print(f"Extended Thinking: {'available' if settings.gemini_api_key else 'not configured'}", flush=True)
+        print(f"Groq fallback: {'available' if settings.groq_api_key and settings.fallback_enabled else 'not configured'}", flush=True)
+        print("JARVIS online. Скажіть «Джарвіс» або натисніть Ctrl+Alt+J. Ctrl+C — вихід.", flush=True)
         conversation_active = False
         last_activity = time.monotonic()
         while True:

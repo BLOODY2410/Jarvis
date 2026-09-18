@@ -54,3 +54,15 @@ def test_live_declarations_are_accepted_by_the_installed_sdk(settings) -> None:
     live = GeminiLiveSession(settings, ToolRegistry(FakeBackend()))
     declarations = live._function_declarations(live.tools.schemas())
     types.LiveConnectConfig(response_modalities=["AUDIO"], tools=[{"function_declarations": declarations}])
+
+
+@pytest.mark.asyncio
+async def test_close_ignores_sdk_cleanup_attribute_error(settings) -> None:
+    class BrokenConnection:
+        async def __aexit__(self, *_args: object) -> None:
+            raise AttributeError("_async_httpx_client")
+
+    live = GeminiLiveSession(settings, ToolRegistry(FakeBackend()))
+    live._connection = BrokenConnection()
+    await live.close()
+    assert live._connection is None

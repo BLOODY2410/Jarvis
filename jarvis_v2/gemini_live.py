@@ -8,6 +8,7 @@ real API key only when a session is opened.
 
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -78,7 +79,12 @@ class GeminiLiveSession:
 
     async def close(self) -> None:
         if self._connection is not None:
-            await self._connection.__aexit__(None, None, None)
+            # Some google-genai releases schedule a second close after a
+            # failed connection before their async HTTP client exists.
+            # The session is already unusable; do not let that cleanup defect
+            # terminate the local voice loop.
+            with suppress(AttributeError):
+                await self._connection.__aexit__(None, None, None)
         self._connection = None
         self._session = None
 
