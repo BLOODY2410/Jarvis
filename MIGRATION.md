@@ -25,7 +25,7 @@ git switch --detach legacy-rust-v1
 
 ## Setup and validation
 
-Use `.env.example` as the complete current configuration. The primary key is `GEMINI_API_KEY`; Groq and Fish are optional. Run `uv run jarvis` after `uv sync --extra voice --extra windows`.
+Use `.env.example` as the complete current configuration. The primary key is `GEMINI_API_KEY`; Groq and Fish are optional. Run `uv run jarvis` after `uv sync --extra voice --extra windows`. Fish is kept in a separate optional extra so it does not make the standard Gemini setup heavy: install it with `uv sync --extra voice --extra windows --extra fish` only when `JARVIS_VOICE_MODE=fish` is needed.
 
 The test suite verifies tool validation, no-fake-success, damaged STT recovery, UA/RU/surzhyk fast intents, multi-intent ordering, provenance persistence, sentence budgeting and the Gemini Live tool-result cycle. It deliberately mocks cloud calls. Before a release, test a real microphone, native Live audio, at least one validated action, screenshot vision and optional Fish output with the target account.
 

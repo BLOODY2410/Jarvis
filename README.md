@@ -21,6 +21,13 @@ uv run jarvis
 
 `start.ps1` performs the same sync and starts one process. `stop.ps1` only stops that one process. There are no localhost sidecars or service ports.
 
+Fish is optional and deliberately excluded from the normal installation because its dependency stack is large. To use `JARVIS_VOICE_MODE=fish`, install and run with its extra:
+
+```powershell
+uv sync --extra voice --extra windows --extra fish
+uv run jarvis
+```
+
 ## Architecture
 
 - **Gemini 3.8 Live** is the primary audio-to-audio, vision, web, and tool-calling brain.

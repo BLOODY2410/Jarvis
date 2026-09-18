@@ -17,12 +17,14 @@ dependencies = [
 
 [project.optional-dependencies]
 voice = [
-  "fishaudio>=0.0.5",
   "keyboard>=0.13.5; platform_system == 'Windows'",
   "numpy>=2.2.0",
   "sounddevice>=0.5.0",
-  "soundfile>=0.13.0",
   "webrtcvad-wheels>=2.0.14",
+]
+fish = [
+  "fishaudio>=0.0.5",
+  "soundfile>=0.13.0",
 ]
 windows = [
   "pillow>=11.0.0",

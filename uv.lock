@@ -547,12 +547,14 @@ dev = [
     { name = "pytest-cov" },
     { name = "ruff" },
 ]
-voice = [
+fish = [
     { name = "fishaudio" },
+    { name = "soundfile" },
+]
+voice = [
     { name = "keyboard", marker = "sys_platform == 'win32'" },
     { name = "numpy" },
     { name = "sounddevice" },
-    { name = "soundfile" },
     { name = "webrtcvad-wheels" },
 ]
 windows = [
@@ -564,7 +566,7 @@ windows = [
 
 [package.metadata]
 requires-dist = [
-    { name = "fishaudio", marker = "extra == 'voice'", specifier = ">=0.0.5" },
+    { name = "fishaudio", marker = "extra == 'fish'", specifier = ">=0.0.5" },
     { name = "google-genai", specifier = ">=1.0.0" },
     { name = "groq", specifier = ">=0.31.0" },
     { name = "keyboard", marker = "sys_platform == 'win32' and extra == 'voice'", specifier = ">=0.13.5" },
@@ -580,10 +582,10 @@ requires-dist = [
     { name = "pywin32", marker = "sys_platform == 'win32' and extra == 'windows'", specifier = ">=308" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.11.0" },
     { name = "sounddevice", marker = "extra == 'voice'", specifier = ">=0.5.0" },
-    { name = "soundfile", marker = "extra == 'voice'", specifier = ">=0.13.0" },
+    { name = "soundfile", marker = "extra == 'fish'", specifier = ">=0.13.0" },
     { name = "webrtcvad-wheels", marker = "extra == 'voice'", specifier = ">=2.0.14" },
 ]
-provides-extras = ["voice", "windows", "dev"]
+provides-extras = ["voice", "fish", "windows", "dev"]
 
 [[package]]
 name = "jinja2"
