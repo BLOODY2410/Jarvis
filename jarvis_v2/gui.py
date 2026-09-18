@@ -123,8 +123,8 @@ class JarvisWindow:
         settings = ttk.LabelFrame(frame, text="Налаштування", padding=14)
         settings.grid(row=4, column=0, sticky="nsew")
         settings.columnconfigure(1, weight=1)
-        self._field(settings, 0, "Gemini API key", self.gemini_key, secret=True)
-        self._field(settings, 1, "Groq API key (резервний)", self.groq_key, secret=True)
+        self._field(settings, 0, "Gemini API key", self.gemini_key, secret=True, paste=self.paste_gemini_key)
+        self._field(settings, 1, "Groq API key (резервний)", self.groq_key, secret=True, paste=self.paste_groq_key)
         self._field(settings, 2, "Wake word", self.wake_word)
         ttk.Label(settings, text="Голос").grid(row=3, column=0, sticky="w", pady=6)
         ttk.Label(settings, text="Gemini Live").grid(row=3, column=1, sticky="w", pady=6)
@@ -136,9 +136,39 @@ class JarvisWindow:
         frame.rowconfigure(4, weight=1)
 
     @staticmethod
-    def _field(parent: ttk.LabelFrame, row: int, label: str, variable: StringVar, secret: bool = False) -> None:
+    def _field(
+        parent: ttk.LabelFrame,
+        row: int,
+        label: str,
+        variable: StringVar,
+        secret: bool = False,
+        paste: object | None = None,
+    ) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=6, padx=(0, 14))
-        ttk.Entry(parent, textvariable=variable, show="•" if secret else "").grid(row=row, column=1, sticky="ew", pady=6)
+        entry_frame = ttk.Frame(parent)
+        entry_frame.grid(row=row, column=1, sticky="ew", pady=6)
+        entry_frame.columnconfigure(0, weight=1)
+        ttk.Entry(entry_frame, textvariable=variable, show="•" if secret else "").grid(row=0, column=0, sticky="ew")
+        if paste is not None:
+            ttk.Button(entry_frame, text="Вставити", command=paste).grid(row=0, column=1, padx=(8, 0))
+
+    def _paste_key(self, destination: StringVar) -> None:
+        try:
+            value = self.root.clipboard_get().strip()
+        except Exception:
+            messagebox.showwarning(APP_TITLE, "У буфері обміну немає тексту для вставлення.")
+            return
+        if not value:
+            messagebox.showwarning(APP_TITLE, "У буфері обміну немає тексту для вставлення.")
+            return
+        destination.set(value)
+        self.status.set("Ключ вставлено. Натисніть «Зберегти налаштування».")
+
+    def paste_gemini_key(self) -> None:
+        self._paste_key(self.gemini_key)
+
+    def paste_groq_key(self) -> None:
+        self._paste_key(self.groq_key)
 
     def _load(self) -> None:
         if self.env_path.exists():
