@@ -38,9 +38,13 @@ dev = [
   "pytest-cov>=6.0.0",
   "ruff>=0.11.0",
 ]
+gui = [
+  "pyinstaller>=6.12.0",
+]
 
 [project.scripts]
 jarvis = "jarvis_v2.app:main"
+jarvis-gui = "jarvis_v2.gui:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["jarvis_v2"]

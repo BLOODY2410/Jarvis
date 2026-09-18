@@ -22,5 +22,9 @@ voice_service/models/*.download
 .coverage
 htmlcov/
 .run/
+build/
+dist/
+*.spec
+build-gui.log
 *.db
 __pycache__/
