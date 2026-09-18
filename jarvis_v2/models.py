@@ -87,6 +87,11 @@ class MediaIntent(IntentBase):
     action: Literal["play_pause", "next", "previous"]
 
 
+class PowerIntent(IntentBase):
+    kind: Literal["power"] = "power"
+    action: Literal["shutdown", "restart", "sleep"]
+
+
 class UnknownIntent(IntentBase):
     kind: Literal["unknown"] = "unknown"
     reason: str = Field(default="", max_length=200)
@@ -103,6 +108,7 @@ Intent = Annotated[
     | ScreenshotIntent
     | ListAppsIntent
     | MediaIntent
+    | PowerIntent
     | UnknownIntent,
     Field(discriminator="kind"),
 ]

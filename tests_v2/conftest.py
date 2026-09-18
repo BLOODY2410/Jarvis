@@ -19,9 +19,5 @@ def settings(tmp_path: Path) -> Settings:
         live_timeout_seconds=0.05,
         circuit_failures=1,
         circuit_cooldown_seconds=60,
-        intent_provider_order=("cerebras", "groq"),
-        conversation_provider_order=("gemini", "groq"),
-        pc_provider_order=("cerebras", "groq"),
-        live_provider_order=("gemini", "groq_compound"),
-        vision_provider_order=("gemini",),
+        fallback_enabled=True,
     )

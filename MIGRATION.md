@@ -1,81 +1,32 @@
-# Migration to JARVIS v2
+# Migration from Rust v1
 
-JARVIS v2 is a new Python-first core, not a line-by-line Rust port. The legacy Rust implementation is intentionally retained until real microphone, TTS, provider, and Windows-action acceptance checks pass on the target PC.
-
-## What changed
-
-```text
-Before: microphone -> Python HTTP :8766 -> Rust -> Python HTTP :8765 -> speakers
-Now:    microphone -> one Python process -> validated intent/tool -> speakers
-```
-
-- `jarvis_v2/` owns routing, providers, memory, persona, tools, vision, observability, and the application loop.
-- The proven `VoiceInputEngine` and `VoiceRouter` are composed directly in-process. Ports 8765 and 8766 are not used by v2.
-- `start.ps1`, `stop.ps1`, and `status.ps1` target v2. Their previous implementations are preserved as `*-legacy.ps1`.
-- `src/`, `Cargo.toml`, and all Rust tests remain intact.
-
-## Installation
-
-JARVIS v2 requires Windows and Python 3.12.
+The active implementation is Python-only. The complete Rust v1 source remains recoverable at Git tag `legacy-rust-v1`.
 
 ```powershell
-cd D:\Jarvis
-.\install.ps1
-Copy-Item .env.example .env  # only when .env does not already exist
-# Add only the API keys you actually use.
-.\test.ps1
+git show legacy-rust-v1:README.md
+git switch --detach legacy-rust-v1
 ```
 
-`install.ps1` installs the editable project and all Windows/voice/test extras with `uv`, then refreshes `uv.lock`. The lock is deliberately constrained to Windows because the application uses Windows audio, settings URIs, and hotkeys.
+## Removed from v2
 
-## Provider migration
+- Rust core, Cargo build, executable replacement flow and the provider router.
+- The Cerebras, Mistral and OpenRouter adapter zoo.
+- HTTP voice-input and TTS sidecars on ports 8765/8766.
+- The broad command matcher that turned unknown nouns into executable names.
+- Legacy startup, status and stop flows built around stale processes.
 
-Missing providers are skipped. Recommended chains are configured independently:
+## Preserved behavior
 
-- intent: Cerebras -> Groq -> Gemini;
-- PC agent: Cerebras -> Groq -> Gemini -> OpenRouter -> Mistral;
-- conversation: Gemini -> Groq -> Cerebras -> OpenRouter -> Mistral;
-- live: Gemini Google Search -> Groq Compound Mini;
-- vision: Gemini -> OpenRouter.
+- Local activation, VAD, short active-conversation window and playback interruption hook.
+- Known wake spellings, safe fast commands, Windows settings URIs, volume/media control, screenshots and protected-process guards.
+- Small local AppIndex behaviour: known aliases, Start Menu shortcuts and PATH dispatch; unknown names are not executed.
+- Fish as an optional output path, with a local Windows speech fallback if Fish is unavailable.
+- Useful timing boundaries and short, complete voice replies.
 
-Each call has an outer timeout and circuit breaker. A timeout or quota error falls through; an auth failure disables that provider for the process lifetime. No startup health call spends quota.
+## Setup and validation
 
-Do not treat `--doctor` or the unit tests as proof that cloud keys work. Live checks are intentionally manual because they spend quota and depend on account access.
+Use `.env.example` as the complete current configuration. The primary key is `GEMINI_API_KEY`; Groq and Fish are optional. Run `uv run jarvis` after `uv sync --extra voice --extra windows`.
 
-## Safety and behavior changes
+The test suite verifies tool validation, no-fake-success, damaged STT recovery, UA/RU/surzhyk fast intents, multi-intent ordering, provenance persistence, sentence budgeting and the Gemini Live tool-result cycle. It deliberately mocks cloud calls. Before a release, test a real microphone, native Live audio, at least one validated action, screenshot vision and optional Fish output with the target account.
 
-- Deterministic fast commands execute without an LLM.
-- Ambiguous actions use a Pydantic JSON-schema classifier; output below the confidence threshold is rejected.
-- Tool arguments are validated again immediately before execution.
-- An action acknowledgement comes only from `ToolResult`. Model prose such as “YouTube відкрито” cannot create success.
-- `Við grey YouTube` and similarly damaged action verbs request clarification and do nothing.
-- “Відкрий новини” is a live-information request, never `open_app`.
-- Live answers are shown as current only if provenance URLs were returned. Only such answers enter grounded memory.
-- Opening an app or URL reports that Windows accepted the launch request; it does not claim the target became usable without verification.
-
-## Voice/STT/TTS
-
-Short audio uses `whisper-large-v3-turbo`; long audio and failed short-model calls use `whisper-large-v3`. `JARVIS_STT_LANGUAGE=auto` allows Ukrainian, Russian, and mixed surzhyk. `JARVIS_CUSTOM_VOCABULARY` is inserted into the documented Whisper prompt field.
-
-Fish Audio remains primary when configured. Piper remains the local fallback. Both are invoked as Python objects rather than HTTP services. Voice responses are reduced only at complete sentence boundaries.
-
-## Rollback
-
-No source rollback is needed:
-
-```powershell
-.\stop.ps1
-.\start-legacy.ps1
-```
-
-Legacy status and stop scripts are `status-legacy.ps1` and `stop-legacy.ps1`. Do not run v2 and legacy voice capture simultaneously.
-
-## Acceptance checklist before removing Rust
-
-1. Run `.\test.ps1`.
-2. Run `.\benchmark-v2.ps1` and retain median/P95 output.
-3. Test 20 wake-word/hotkey turns in Ukrainian, Russian, and surzhyk.
-4. Verify Fish, forced Piper fallback, barge-in setting, and post-TTS guard.
-5. Verify volume, mute, Settings pages, app launch/close, screenshot, vision, and multi-intent actions.
-6. With real keys, verify timeout fallback and live provenance. Record failures honestly; do not replace contract tests with claimed live success.
-7. Keep the Rust core until this checklist passes on the user's PC.
+Known operational limitation: the optional OpenWakeWord package does not currently ship a compatible CPython 3.12 wheel in this environment. Ctrl+Alt+J remains the reliable local activation path until a compatible Ukrainian wake backend is installed; the microphone is not sent to Gemini before activation.

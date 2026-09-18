@@ -15,6 +15,7 @@ from jarvis_v2.models import (
     OpenAppIntent,
     OpenUrlIntent,
     PersonalityMode,
+    PowerIntent,
     Route,
     ScreenshotIntent,
     SetMuteIntent,
@@ -182,6 +183,13 @@ def _single(text: str) -> IntentEnvelope | None:
         return _envelope(text, [MediaIntent(action="next")])
     if normalized in {"попередній трек", "увімкни попередній трек"}:
         return _envelope(text, [MediaIntent(action="previous")])
+
+    if normalized in {"вимкни комп'ютер", "выключи компьютер", "shutdown"}:
+        return _envelope(text, [PowerIntent(action="shutdown")])
+    if normalized in {"перезавантаж комп'ютер", "перезагрузи компьютер", "restart"}:
+        return _envelope(text, [PowerIntent(action="restart")])
+    if normalized in {"приспати комп'ютер", "переведи в сон", "sleep"}:
+        return _envelope(text, [PowerIntent(action="sleep")])
 
     setting_match = re.match(r"^(?:відкрий|відкрити|покажи|перейди в)\s+(.+)$", normalized)
     if setting_match:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 from jarvis_v2.config import Settings
@@ -10,6 +11,7 @@ from jarvis_v2.models import (
     AgentReply,
     IntentEnvelope,
     PersonalityMode,
+    PowerIntent,
     Route,
     ToolResult,
     UnknownIntent,
@@ -47,6 +49,25 @@ class JarvisAgent:
     async def handle(self, text: str, *, voice: bool = True) -> AgentReply:
         trace = LatencyTrace(text)
         self._remember_message("user", text)
+        if self.session.pending_confirmation:
+            pending = self.session.pending_confirmation
+            if time.monotonic() - self.session.pending_confirmation_created_at > 30:
+                self.session.pending_confirmation = None
+                return self._reply(
+                    "Час підтвердження минув. Дію скасовано.",
+                    Route.PC_AGENT,
+                    PersonalityMode.PC_AGENT,
+                    voice=voice,
+                )
+            normalized = text.lower().strip(" .!?")
+            if normalized in {"так", "підтверджую", "підтверди", "yes"}:
+                self.session.pending_confirmation = None
+                result = await asyncio.to_thread(self.tools.execute_intent, pending)
+                return self._tool_reply([result], voice=voice)
+            if normalized in {"ні", "скасуй", "відміна", "cancel", "no"}:
+                self.session.pending_confirmation = None
+                return self._reply("Дію скасовано.", Route.PC_AGENT, PersonalityMode.PC_AGENT, voice=voice)
+            return self._reply("Очікую чітке підтвердження або скасування дії.", Route.PC_AGENT, PersonalityMode.PC_AGENT, voice=voice)
         envelope = deterministic_intent(text)
         trace.mark("intent")
         if envelope is None and looks_like_action(text):
@@ -89,6 +110,17 @@ class JarvisAgent:
         return reply
 
     async def _pc(self, envelope: IntentEnvelope, text: str, *, voice: bool) -> AgentReply:
+        power = next((intent for intent in envelope.intents if isinstance(intent, PowerIntent)), None)
+        if power:
+            self.session.pending_confirmation = power
+            self.session.pending_confirmation_created_at = time.monotonic()
+            labels = {"shutdown": "вимкнення", "restart": "перезавантаження", "sleep": "сон"}
+            return self._reply(
+                f"Підтвердьте {labels[power.action]} комп'ютера.",
+                Route.PC_AGENT,
+                PersonalityMode.PC_AGENT,
+                voice=voice,
+            )
         if envelope.intents:
             if any(isinstance(intent, UnknownIntent) for intent in envelope.intents):
                 return self._reply(
@@ -311,7 +343,18 @@ class JarvisAgent:
             return
         self.session.recent_tools.append(result)
         if result.success:
-            self.session.last_entity = str(result.data.get("app") or result.data.get("url") or result.tool)
+            self.session.last_tool = result.tool
+            if app := result.data.get("app"):
+                self.session.last_app = str(app)
+                self.session.last_entity = self.session.last_app
+                self.session.recent_entities.append(self.session.last_app)
+            if url := result.data.get("url"):
+                self.session.last_url = str(url)
+                self.session.last_entity = self.session.last_url
+                self.session.recent_entities.append(self.session.last_url)
+            if screen := result.data.get("path"):
+                self.session.last_screen = str(screen)
+                self.session.last_entity = self.session.last_screen
         if self.memory:
             self.memory.tool(self.session.session_id, result)
 

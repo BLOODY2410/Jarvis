@@ -54,6 +54,11 @@ class FakeBackend:
 
         return ToolResult(tool="media", success=True, message=action)
 
+    def power(self, action):
+        from jarvis_v2.models import ToolResult
+
+        return ToolResult(tool="power", success=True, message=action, data={"action": action})
+
 
 def test_tool_arguments_are_validated() -> None:
     registry = ToolRegistry(FakeBackend())
@@ -69,3 +74,9 @@ def test_windows_settings_uri_contract() -> None:
     result = registry.execute("windows_settings", {"page": "sound"})
     assert result.success
     assert result.message == "ms-settings:sound"
+
+
+def test_power_is_not_a_direct_model_tool() -> None:
+    registry = ToolRegistry(FakeBackend())
+    assert "power" not in {schema["function"]["name"] for schema in registry.schemas()}
+    assert not registry.execute("power", {"action": "shutdown"}).success

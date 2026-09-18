@@ -27,30 +27,25 @@ def _boolean(name: str, default: bool) -> bool:
 
 def _secret(name: str) -> str | None:
     value = _text(name)
-    return value if value and value not in {"replace_me", "changeme"} else None
+    return value if value and value.lower() not in {"replace_me", "changeme"} else None
 
 
 @dataclass(frozen=True, slots=True)
 class Settings:
+    """Small, explicit runtime configuration. Keys are optional and never logged."""
+
     root: Path
-    groq_api_key: str | None
-    cerebras_api_key: str | None
     gemini_api_key: str | None
-    openrouter_api_key: str | None
-    mistral_api_key: str | None
-    groq_model: str
-    groq_compound_model: str
-    cerebras_model: str
-    gemini_model: str
+    groq_api_key: str | None
+    fish_api_key: str | None
+    fish_voice_id: str | None
     gemini_live_model: str
-    openrouter_model: str | None
-    mistral_model: str | None
-    intent_provider_order: tuple[str, ...]
-    conversation_provider_order: tuple[str, ...]
-    pc_provider_order: tuple[str, ...]
-    live_provider_order: tuple[str, ...]
-    vision_provider_order: tuple[str, ...]
-    connect_timeout_seconds: float
+    gemini_extended_model: str
+    gemini_text_model: str
+    groq_model: str
+    voice_mode: str
+    fallback_enabled: bool
+    debug: bool
     request_timeout_seconds: float
     live_timeout_seconds: float
     circuit_failures: int
@@ -60,6 +55,8 @@ class Settings:
     voice_max_sentences: int
     max_context_turns: int
     conversation_timeout_seconds: int
+    wake_word: str
+    wake_variants: tuple[str, ...]
     custom_vocabulary: tuple[str, ...]
     memory_path: Path
     latency_log_path: Path
@@ -69,10 +66,6 @@ class Settings:
     @classmethod
     def from_env(cls, root: Path = ROOT) -> Settings:
         load_dotenv(root / ".env", override=False)
-
-        def order(name: str, default: str) -> tuple[str, ...]:
-            return tuple(item.strip().lower() for item in _text(name, default).split(",") if item.strip())
-
         vocabulary = tuple(
             item.strip()
             for item in _text(
@@ -81,37 +74,38 @@ class Settings:
             ).split(",")
             if item.strip()
         )
+        wake_word = _text("JARVIS_WAKE_WORD", "джарвіс").lower()
+        variants = tuple(
+            dict.fromkeys(
+                item.strip().lower()
+                for item in _text("JARVIS_WAKE_VARIANTS", f"{wake_word},джарвис,джарвиз,jarvis").split(",")
+                if item.strip()
+            )
+        )
         return cls(
             root=root,
-            groq_api_key=_secret("GROQ_API_KEY"),
-            cerebras_api_key=_secret("CEREBRAS_API_KEY"),
             gemini_api_key=_secret("GEMINI_API_KEY"),
-            openrouter_api_key=_secret("OPENROUTER_API_KEY"),
-            mistral_api_key=_secret("MISTRAL_API_KEY"),
+            groq_api_key=_secret("GROQ_API_KEY"),
+            fish_api_key=_secret("FISH_API_KEY"),
+            fish_voice_id=_secret("FISH_VOICE_ID"),
+            gemini_live_model=_text("GEMINI_LIVE_MODEL", "gemini-3.8-live"),
+            gemini_extended_model=_text("GEMINI_EXTENDED_MODEL", "gemini-3.8-live-extended-thinking"),
+            gemini_text_model=_text("GEMINI_TEXT_MODEL", "gemini-3.8-flash"),
             groq_model=_text("GROQ_MODEL", "openai/gpt-oss-120b"),
-            groq_compound_model=_text("GROQ_COMPOUND_MODEL", "groq/compound-mini"),
-            cerebras_model=_text("CEREBRAS_MODEL", "gpt-oss-120b"),
-            gemini_model=_text("GEMINI_SMART_MODEL", "gemini-3.6-flash"),
-            gemini_live_model=_text("GEMINI_LIVE_MODEL", "gemini-3.6-flash"),
-            openrouter_model=_text("OPENROUTER_MODEL") or None,
-            mistral_model=_text("MISTRAL_MODEL") or None,
-            intent_provider_order=order("JARVIS_INTENT_PROVIDER_ORDER", "cerebras,groq,gemini"),
-            conversation_provider_order=order(
-                "JARVIS_CHAT_PROVIDER_ORDER", "gemini,groq,cerebras,openrouter,mistral"
-            ),
-            pc_provider_order=order("JARVIS_PC_PROVIDER_ORDER", "cerebras,groq,gemini,openrouter,mistral"),
-            live_provider_order=order("JARVIS_LIVE_PROVIDER_ORDER", "gemini,groq_compound"),
-            vision_provider_order=order("JARVIS_VISION_PROVIDER_ORDER", "gemini,openrouter"),
-            connect_timeout_seconds=_integer("JARVIS_AI_CONNECT_TIMEOUT_MS", 1500, 100) / 1000,
-            request_timeout_seconds=_integer("JARVIS_AI_READ_TIMEOUT_MS", 3500, 250) / 1000,
+            voice_mode=_text("JARVIS_VOICE_MODE", "gemini").lower(),
+            fallback_enabled=_boolean("JARVIS_FALLBACK_ENABLED", True),
+            debug=_boolean("JARVIS_DEBUG", False),
+            request_timeout_seconds=_integer("JARVIS_REQUEST_TIMEOUT_MS", 3500, 250) / 1000,
             live_timeout_seconds=_integer("JARVIS_LIVE_TIMEOUT_MS", 7000, 500) / 1000,
-            circuit_failures=_integer("JARVIS_AI_CIRCUIT_FAILURES", 1, 1),
-            circuit_cooldown_seconds=_integer("JARVIS_AI_TIMEOUT_COOLDOWN_SECS", 90, 1),
+            circuit_failures=_integer("JARVIS_CIRCUIT_FAILURES", 1, 1),
+            circuit_cooldown_seconds=_integer("JARVIS_CIRCUIT_COOLDOWN_SECS", 90, 1),
             max_tool_rounds=_integer("JARVIS_MAX_TOOL_ROUNDS", 6, 1),
             voice_max_chars=_integer("JARVIS_VOICE_MAX_CHARS", 280, 80),
             voice_max_sentences=_integer("JARVIS_VOICE_MAX_SENTENCES", 2, 1),
             max_context_turns=_integer("JARVIS_MAX_CONTEXT_TURNS", 8, 1),
-            conversation_timeout_seconds=_integer("JARVIS_CONVERSATION_TIMEOUT_SECS", 60, 5),
+            conversation_timeout_seconds=_integer("JARVIS_CONVERSATION_TIMEOUT_SECS", 45, 5),
+            wake_word=wake_word,
+            wake_variants=variants,
             custom_vocabulary=vocabulary,
             memory_path=Path(_text("JARVIS_MEMORY_PATH", str(root / "data" / "jarvis-v2.db"))),
             latency_log_path=Path(_text("JARVIS_LATENCY_LOG", str(root / "logs" / "latency-v2.jsonl"))),
@@ -120,15 +114,11 @@ class Settings:
         )
 
     def configured_providers(self) -> set[str]:
-        result: set[str] = set()
-        if self.groq_api_key:
-            result.update({"groq", "groq_compound"})
-        if self.cerebras_api_key:
-            result.add("cerebras")
+        providers: set[str] = set()
         if self.gemini_api_key:
-            result.add("gemini")
-        if self.openrouter_api_key and self.openrouter_model:
-            result.add("openrouter")
-        if self.mistral_api_key and self.mistral_model:
-            result.add("mistral")
-        return result
+            providers.add("gemini")
+        if self.fallback_enabled and self.groq_api_key:
+            providers.add("groq")
+        if self.fish_api_key:
+            providers.add("fish")
+        return providers

@@ -47,8 +47,8 @@ class UngroundedGemini:
 
 
 class GroundedCompound:
-    name = "groq_compound"
-    model = "groq/compound-mini"
+    name = "groq"
+    model = "emergency"
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
         return ProviderResponse(
@@ -94,5 +94,5 @@ async def test_ungrounded_live_response_falls_back(settings) -> None:
             route=Route.LIVE_CURRENT,
         )
     )
-    assert response.provider == "groq_compound"
+    assert response.provider == "groq"
     assert response.fallback_count == 1

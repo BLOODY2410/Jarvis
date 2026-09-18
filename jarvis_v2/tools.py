@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import os
 import re
+import shutil
 import subprocess
 import time
 from collections.abc import Callable
@@ -21,6 +22,7 @@ from jarvis_v2.models import (
     MediaIntent,
     OpenAppIntent,
     OpenUrlIntent,
+    PowerIntent,
     ScreenshotIntent,
     SetMuteIntent,
     SetVolumeIntent,
@@ -83,6 +85,27 @@ class ScreenshotArgs(BaseModel):
 class MediaArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     action: str
+
+
+class PowerArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: str
+
+
+class FileSearchArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    query: str = Field(min_length=1, max_length=120, pattern=r"^[\w .()'\-]+$")
+
+
+class FilePathArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: str = Field(min_length=1, max_length=260)
+
+
+class FileTransferArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source: str = Field(min_length=1, max_length=260)
+    destination: str = Field(min_length=1, max_length=260)
 
 
 @dataclass(slots=True)
@@ -154,7 +177,8 @@ class WindowsBackend:
         from pycaw.pycaw import AudioUtilities
 
         device = AudioUtilities.GetSpeakers()
-        return getattr(device, "EndpointVolume", device.Activate())
+        endpoint = getattr(device, "EndpointVolume", None)
+        return endpoint if endpoint is not None else device.Activate()
 
     def set_volume(self, level: int) -> ToolResult:
         try:
@@ -371,6 +395,91 @@ class WindowsBackend:
             tool="media", success=True, message="Медіакоманду надіслано.", data={"action": action}
         )
 
+    @staticmethod
+    def _safe_user_path(value: str) -> Path:
+        home = Path(os.getenv("USERPROFILE", str(Path.home()))).resolve()
+        candidate = Path(value).expanduser().resolve()
+        try:
+            candidate.relative_to(home)
+        except ValueError as error:
+            raise ValueError("Дозволені лише шляхи у профілі поточного користувача.") from error
+        return candidate
+
+    def search_files(self, query: str) -> ToolResult:
+        home = Path(os.getenv("USERPROFILE", str(Path.home())))
+        matches: list[str] = []
+        try:
+            for root_name in ("Desktop", "Documents", "Downloads"):
+                root = home / root_name
+                if not root.is_dir():
+                    continue
+                for path in root.rglob("*"):
+                    if query.lower() in path.name.lower():
+                        matches.append(str(path))
+                        if len(matches) == 30:
+                            break
+                if len(matches) == 30:
+                    break
+        except OSError as error:
+            return ToolResult(tool="file_search", success=False, message=f"Пошук не вдався: {error}.")
+        return ToolResult(
+            tool="file_search",
+            success=True,
+            message=f"Знайдено {len(matches)} збігів.",
+            data={"paths": matches},
+        )
+
+    def open_file(self, path: str) -> ToolResult:
+        try:
+            target = self._safe_user_path(path)
+            if not target.is_file():
+                return ToolResult(tool="open_file", success=False, message="Файл не знайдено.")
+            os.startfile(target)  # type: ignore[attr-defined]
+        except (OSError, ValueError) as error:
+            return ToolResult(tool="open_file", success=False, message=f"Файл не відкрито: {error}.")
+        return ToolResult(tool="open_file", success=True, message="Windows прийняла запит на відкриття файла.", data={"path": str(target)})
+
+    def create_folder(self, path: str) -> ToolResult:
+        try:
+            target = self._safe_user_path(path)
+            target.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            return ToolResult(tool="create_folder", success=False, message="Така папка вже існує.")
+        except (OSError, ValueError) as error:
+            return ToolResult(tool="create_folder", success=False, message=f"Папку не створено: {error}.")
+        return ToolResult(tool="create_folder", success=True, message="Папку створено.", data={"path": str(target)})
+
+    def transfer_file(self, source: str, destination: str, *, move: bool) -> ToolResult:
+        try:
+            origin = self._safe_user_path(source)
+            target = self._safe_user_path(destination)
+            if not origin.is_file() or target.exists():
+                return ToolResult(tool="move_file" if move else "copy_file", success=False, message="Некоректний вихідний або цільовий файл.")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if move:
+                shutil.move(str(origin), str(target))
+            else:
+                shutil.copy2(origin, target)
+        except (OSError, ValueError) as error:
+            return ToolResult(tool="move_file" if move else "copy_file", success=False, message=f"Операція з файлом не вдалася: {error}.")
+        name = "переміщено" if move else "скопійовано"
+        return ToolResult(tool="move_file" if move else "copy_file", success=True, message=f"Файл {name}.", data={"path": str(target)})
+
+    @staticmethod
+    def power(action: str) -> ToolResult:
+        command = {
+            "shutdown": ["shutdown.exe", "/s", "/t", "0"],
+            "restart": ["shutdown.exe", "/r", "/t", "0"],
+            "sleep": ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"],
+        }.get(action)
+        if command is None:
+            return ToolResult(tool="power", success=False, message="Невідома дія живлення.")
+        try:
+            subprocess.Popen(command, close_fds=True)
+        except OSError as error:
+            return ToolResult(tool="power", success=False, message=f"Windows не прийняла дію: {error}.")
+        return ToolResult(tool="power", success=True, message="Дію живлення передано Windows.", data={"action": action})
+
 
 class ToolRegistry:
     def __init__(self, backend: WindowsBackend | None = None) -> None:
@@ -433,12 +542,34 @@ class ToolRegistry:
                 MediaArgs,
                 lambda args: self.backend.media(args.action),
             ),
+            "power": ToolDefinition(
+                "power",
+                "Run a shutdown, restart, or sleep action only after local confirmation.",
+                PowerArgs,
+                lambda args: self.backend.power(args.action),
+            ),
+            "file_search": ToolDefinition("file_search", "Search standard user folders by file name.", FileSearchArgs, lambda args: self.backend.search_files(args.query)),
+            "open_file": ToolDefinition("open_file", "Open one existing file inside the user profile.", FilePathArgs, lambda args: self.backend.open_file(args.path)),
+            "create_folder": ToolDefinition("create_folder", "Create a new folder inside the user profile.", FilePathArgs, lambda args: self.backend.create_folder(args.path)),
+            "copy_file": ToolDefinition("copy_file", "Copy a file after host confirmation.", FileTransferArgs, lambda args: self.backend.transfer_file(args.source, args.destination, move=False)),
+            "move_file": ToolDefinition("move_file", "Move a file after host confirmation.", FileTransferArgs, lambda args: self.backend.transfer_file(args.source, args.destination, move=True)),
         }
 
     def schemas(self) -> list[dict[str, object]]:
-        return [tool.schema() for tool in self._tools.values()]
+        # Power needs a host-owned user confirmation, so the model cannot invoke
+        # it directly by inventing an argument or a confirmation token.
+        return [tool.schema() for name, tool in self._tools.items() if name not in {"power", "copy_file", "move_file"}]
 
     def execute(self, name: str, arguments: dict[str, object]) -> ToolResult:
+        if name in {"power", "copy_file", "move_file"}:
+            return ToolResult(
+                tool=name,
+                success=False,
+                message="Ця дія потребує підтвердження користувача й відхилена в прямому виклику.",
+            )
+        return self._execute(name, arguments)
+
+    def _execute(self, name: str, arguments: dict[str, object]) -> ToolResult:
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult(
@@ -458,6 +589,12 @@ class ToolRegistry:
             return ToolResult(
                 tool=name, success=False, message=f"Інструмент завершився помилкою: {type(error).__name__}."
             )
+
+    def execute_confirmed(self, name: str, arguments: dict[str, object]) -> ToolResult:
+        """Host-only path after an explicit, canonical user confirmation."""
+        if name not in {"power", "copy_file", "move_file"}:
+            return ToolResult(tool=name, success=False, message="Ця дія не потребує confirmed executor.")
+        return self._execute(name, arguments)
 
     def execute_intent(self, intent: Intent) -> ToolResult:
         if isinstance(intent, SetVolumeIntent):
@@ -480,4 +617,6 @@ class ToolRegistry:
             return self.execute("list_apps", {})
         if isinstance(intent, MediaIntent):
             return self.execute("media", {"action": intent.action})
+        if isinstance(intent, PowerIntent):
+            return self.execute_confirmed("power", {"action": intent.action})
         return ToolResult(tool=intent.kind, success=False, message="Невідомий intent не виконано.")

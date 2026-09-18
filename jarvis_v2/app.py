@@ -10,7 +10,9 @@ from pathlib import Path
 from jarvis_v2.agent import JarvisAgent
 from jarvis_v2.benchmark import run as run_benchmark
 from jarvis_v2.config import Settings
+from jarvis_v2.gemini_live import GeminiLiveSession
 from jarvis_v2.memory import MemoryStore
+from jarvis_v2.models import PersonalityMode
 from jarvis_v2.providers import ProviderRouter
 from jarvis_v2.tools import ToolRegistry
 from jarvis_v2.voice import InProcessVoiceRuntime
@@ -54,46 +56,76 @@ async def run_text(agent: JarvisAgent, text: str) -> int:
 
 
 async def run_voice(agent: JarvisAgent, settings: Settings) -> int:
-    runtime = InProcessVoiceRuntime(
-        input_enabled=settings.voice_input_enabled,
-        tts_enabled=settings.tts_enabled,
-        custom_vocabulary=settings.custom_vocabulary,
-    )
+    runtime = InProcessVoiceRuntime(settings)
     lock = ProcessLock(settings.root)
     lock.acquire()
+    live: GeminiLiveSession | None = None
     try:
         await runtime.start()
-        print("JARVIS v2 готовий. Скажіть «Джарвіс» або натисніть Ctrl+Alt+J. Ctrl+C — вихід.")
+        print("JARVIS v2")
+        print(f"Gemini 3.8 Live: {'available' if settings.gemini_api_key else 'not configured'}")
+        print(f"Extended Thinking: {'available' if settings.gemini_api_key else 'not configured'}")
+        print(f"Groq fallback: {'available' if settings.groq_api_key and settings.fallback_enabled else 'not configured'}")
+        print("JARVIS online. Скажіть «Джарвіс» або натисніть Ctrl+Alt+J. Ctrl+C — вихід.")
         conversation_active = False
         last_activity = time.monotonic()
         while True:
             event = await runtime.next_event()
-            kind = event.get("type")
+            kind = event.kind
             if (
                 conversation_active
                 and time.monotonic() - last_activity >= settings.conversation_timeout_seconds
             ):
-                runtime.set_state(False, False)
+                runtime.deactivate()
                 conversation_active = False
+                if live:
+                    await live.close()
+                    live = None
             if kind == "wake":
                 conversation_active = True
                 last_activity = time.monotonic()
                 await runtime.activation_cue()
                 continue
             if kind == "interrupt":
+                runtime.interrupt_playback()
                 continue
-            if kind != "transcript":
-                continue
-            text = str(event.get("text", "")).strip()
-            if not text:
+            if kind != "audio":
                 continue
             conversation_active = True
             last_activity = time.monotonic()
+            if settings.voice_mode == "gemini" and settings.gemini_api_key:
+                try:
+                    if live is None:
+                        live = GeminiLiveSession(settings, agent.tools)
+                        await live.connect(agent.persona.prompt(PersonalityMode.CASUAL))
+                    live.action_dispatched = False
+                    await live.send_audio(event.audio)
+                    response = await live.receive_turn()
+                    if response.text:
+                        print(f"JARVIS: {response.text}")
+                    await runtime.play_pcm(response.audio_pcm)
+                    continue
+                except Exception as error:
+                    if settings.debug:
+                        print(f"[Gemini] Live unavailable: {type(error).__name__}")
+                    action_dispatched = bool(live and live.action_dispatched)
+                    if live:
+                        await live.close()
+                    live = None
+                    if action_dispatched:
+                        print("JARVIS: Зв'язок обірвався після запуску дії. Її стан невідомий; повторно не запускаю.")
+                        continue
+            text = await runtime.transcribe_fallback(event.audio)
+            if not text:
+                print("JARVIS: Не почув команду. Повторіть, будь ласка.")
+                continue
             print(f"Ви: {text}")
             reply = await agent.handle(text, voice=True)
             print(f"JARVIS: {reply.text}")
-            await runtime.speak(reply.voice_text)
+            await runtime.speak_fallback(reply.voice_text)
     finally:
+        if live:
+            await live.close()
         await runtime.stop()
         lock.release()
 
@@ -121,7 +153,7 @@ async def async_main() -> int:
                     "voice_input": settings.voice_input_enabled,
                     "tts": settings.tts_enabled,
                     "localhost_sidecars": False,
-                    "legacy_rust_preserved": (settings.root / "Cargo.toml").exists(),
+                    "voice_mode": settings.voice_mode,
                 },
                 ensure_ascii=False,
                 indent=2,

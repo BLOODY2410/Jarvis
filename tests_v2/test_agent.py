@@ -34,7 +34,7 @@ class UngroundedProvider:
 
 
 class FakeSuccessProvider:
-    name = "cerebras"
+    name = "gemini"
     model = "pc"
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
@@ -92,3 +92,14 @@ async def test_multi_intent_executes_in_order(settings) -> None:
     reply = await agent.handle("відкрий Chrome а потім постав гучність на 30", voice=False)
     assert [result.tool for result in reply.tool_results] == ["open_app", "set_volume"]
     assert all(result.success for result in reply.tool_results)
+
+
+@pytest.mark.asyncio
+async def test_power_action_needs_explicit_confirmation(settings) -> None:
+    agent = JarvisAgent(settings, ProviderRouter(settings, []), ToolRegistry(FakeBackend()))
+    waiting = await agent.handle("вимкни комп'ютер", voice=False)
+    assert "Підтвердьте" in waiting.text
+    assert not waiting.tool_results
+    completed = await agent.handle("підтверджую", voice=False)
+    assert completed.tool_results[0].tool == "power"
+    assert completed.tool_results[0].success

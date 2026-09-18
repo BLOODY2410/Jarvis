@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from jarvis_v2.models import GroundingSource, ToolResult
+from jarvis_v2.models import GroundingSource, Intent, ToolResult
 
 
 @dataclass(slots=True)
@@ -20,11 +20,24 @@ class SessionState:
     grounded_facts: deque[dict[str, object]] = field(default_factory=lambda: deque(maxlen=20))
     last_entity: str | None = None
     current_topic: str | None = None
+    last_app: str | None = None
+    last_url: str | None = None
+    last_screen: str | None = None
+    last_tool: str | None = None
+    recent_entities: deque[str] = field(default_factory=lambda: deque(maxlen=20))
+    conversation_summary: str = ""
+    pending_confirmation: Intent | None = None
+    pending_confirmation_created_at: float = 0
 
     def add_message(self, role: str, content: str, max_turns: int) -> None:
         self.messages.append({"role": role, "content": content})
         while sum(item["role"] == "user" for item in self.messages) > max_turns:
             self.messages.popleft()
+        if role == "user":
+            self.current_topic = content
+        if len(self.messages) >= max_turns * 2:
+            recent = list(self.messages)[-4:]
+            self.conversation_summary = " ".join(item["content"] for item in recent)
 
 
 class MemoryStore:
