@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from jarvis_v2.agent import JarvisAgent
+from jarvis_v2.app import _live_error_message
 from jarvis_v2.memory import MemoryStore
 from jarvis_v2.models import GroundingSource, ProviderResponse, Route
 from jarvis_v2.providers import ProviderRequest, ProviderRouter
@@ -103,3 +104,8 @@ async def test_power_action_needs_explicit_confirmation(settings) -> None:
     completed = await agent.handle("підтверджую", voice=False)
     assert completed.tool_results[0].tool == "power"
     assert completed.tool_results[0].success
+
+
+def test_quota_error_is_reported_honestly() -> None:
+    message = _live_error_message(RuntimeError("You exceeded your current quota"))
+    assert "вичерпано" in message.lower()

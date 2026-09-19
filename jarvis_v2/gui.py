@@ -13,7 +13,13 @@ import threading
 from pathlib import Path
 from tkinter import BooleanVar, StringVar, Tk, messagebox, ttk
 
-from jarvis_v2.processes import any_runtime_is_running, read_runtime_state, request_activation, request_stop
+from jarvis_v2.processes import (
+    any_runtime_is_running,
+    read_runtime_error,
+    read_runtime_state,
+    request_activation,
+    request_stop,
+)
 
 APP_TITLE = "JARVIS v2"
 DEFAULT_ENV = """GEMINI_API_KEY=
@@ -278,10 +284,12 @@ class JarvisWindow:
         if state:
             self._launching = False
             self.start_button.state(["disabled"])
+            error = read_runtime_error()
+            suffix = f" · {error}" if error else ""
             if Path(state.root) == self.project.resolve():
-                self.status.set(f"JARVIS працює · PID {state.pid}")
+                self.status.set(f"JARVIS працює · PID {state.pid}{suffix}")
             else:
-                self.status.set(f"JARVIS працює в іншій папці · PID {state.pid}")
+                self.status.set(f"JARVIS працює в іншій папці · PID {state.pid}{suffix}")
         elif any_runtime_is_running():
             self._launching = False
             self.start_button.state(["disabled"])

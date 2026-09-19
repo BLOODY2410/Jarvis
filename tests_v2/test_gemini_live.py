@@ -53,7 +53,10 @@ def test_live_declarations_are_accepted_by_the_installed_sdk(settings) -> None:
 
     live = GeminiLiveSession(settings, ToolRegistry(FakeBackend()))
     declarations = live._function_declarations(live.tools.schemas())
-    types.LiveConnectConfig(response_modalities=["AUDIO"], tools=[{"function_declarations": declarations}])
+    config = types.LiveConnectConfig(
+        response_modalities=["AUDIO"], tools=[types.Tool(function_declarations=declarations)]
+    )
+    assert config.tools[0].function_declarations[0].parameters_json_schema["additionalProperties"] is False
 
 
 @pytest.mark.asyncio

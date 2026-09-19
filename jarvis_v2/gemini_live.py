@@ -43,18 +43,28 @@ class GeminiLiveSession:
         return self._client
 
     @staticmethod
-    def _function_declarations(schemas: list[dict[str, object]]) -> list[dict[str, object]]:
-        declarations: list[dict[str, object]] = []
+    def _function_declarations(schemas: list[dict[str, object]]) -> list[Any]:
+        """Build SDK declarations without mutating JSON Schema field names."""
+        from google.genai import types
+
+        declarations: list[Any] = []
         for schema in schemas:
             function = schema.get("function")
             if not isinstance(function, dict):
                 continue
-            declaration = dict(function)
-            declaration.pop("strict", None)
+            parameters = function.get("parameters")
+            if not isinstance(parameters, dict):
+                continue
             # Windows mutations are sequential: Gemini receives the authoritative
             # receipt before it can plan the next action.
-            declaration["behavior"] = "BLOCKING"
-            declarations.append(declaration)
+            declarations.append(
+                types.FunctionDeclaration(
+                    name=str(function.get("name", "")),
+                    description=str(function.get("description", "")),
+                    parameters_json_schema=parameters,
+                    behavior="BLOCKING",
+                )
+            )
         return declarations
 
     async def connect(self, system_instruction: str, *, native_audio: bool = True) -> None:
@@ -63,17 +73,18 @@ class GeminiLiveSession:
             return
         if not self.settings.gemini_api_key:
             raise RuntimeError("GEMINI_API_KEY is required for Gemini Live.")
-        tools: list[dict[str, object]] = [
-            {"function_declarations": self._function_declarations(self.tools.schemas())},
-            {"google_search": {}},
-        ]
-        config = {
-            "response_modalities": ["AUDIO"] if native_audio else ["TEXT"],
-            "system_instruction": system_instruction,
-            "tools": tools,
-            "input_audio_transcription": {},
-            "output_audio_transcription": {},
-        }
+        from google.genai import types
+
+        config = types.LiveConnectConfig(
+            response_modalities=["AUDIO"] if native_audio else ["TEXT"],
+            system_instruction=system_instruction,
+            tools=[
+                types.Tool(function_declarations=self._function_declarations(self.tools.schemas())),
+                types.Tool(google_search=types.GoogleSearch()),
+            ],
+            input_audio_transcription=types.AudioTranscriptionConfig(),
+            output_audio_transcription=types.AudioTranscriptionConfig(),
+        )
         self._connection = self._client_for_key().aio.live.connect(model=self.model, config=config)  # type: ignore[attr-defined]
         self._session = await self._connection.__aenter__()
 

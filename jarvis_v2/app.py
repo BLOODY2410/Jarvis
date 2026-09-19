@@ -14,7 +14,13 @@ from jarvis_v2.config import Settings
 from jarvis_v2.gemini_live import GeminiLiveSession
 from jarvis_v2.memory import MemoryStore
 from jarvis_v2.models import PersonalityMode
-from jarvis_v2.processes import RUNTIME_MUTEX, clear_runtime_state, write_runtime_state
+from jarvis_v2.processes import (
+    RUNTIME_MUTEX,
+    clear_runtime_error,
+    clear_runtime_state,
+    write_runtime_error,
+    write_runtime_state,
+)
 from jarvis_v2.providers import ProviderRouter
 from jarvis_v2.tools import ToolRegistry
 from jarvis_v2.voice import InProcessVoiceRuntime
@@ -61,6 +67,15 @@ def build_agent(settings: Settings) -> JarvisAgent:
     return JarvisAgent(settings, ProviderRouter.from_settings(settings), ToolRegistry(), memory=memory)
 
 
+def _live_error_message(error: Exception) -> str:
+    detail = str(error).lower()
+    if "quota" in detail or "exceeded" in detail:
+        return "Gemini API відхилив команду: для цього ключа вичерпано доступну квоту."
+    if "api key" in detail or "unauthenticated" in detail or "permission" in detail:
+        return "Gemini API відхилив ключ. Перевірте API key та доступ до Gemini Live."
+    return f"Gemini Live тимчасово недоступний ({type(error).__name__})."
+
+
 async def run_text(agent: JarvisAgent, text: str) -> int:
     reply = await agent.handle(text, voice=False)
     print(reply.text)
@@ -71,6 +86,7 @@ async def run_voice(agent: JarvisAgent, settings: Settings) -> int:
     runtime = InProcessVoiceRuntime(settings)
     lock = ProcessLock(settings.root)
     lock.acquire()
+    clear_runtime_error()
     live: GeminiLiveSession | None = None
     try:
         await runtime.start()
@@ -121,14 +137,20 @@ async def run_voice(agent: JarvisAgent, settings: Settings) -> int:
                     await runtime.play_pcm(response.audio_pcm)
                     continue
                 except Exception as error:
+                    message = _live_error_message(error)
+                    write_runtime_error(message)
+                    print(f"JARVIS: {message}", flush=True)
                     if settings.debug:
-                        print(f"[Gemini] Live unavailable: {type(error).__name__}")
+                        print(f"[Gemini] detail: {error}", flush=True)
                     action_dispatched = bool(live and live.action_dispatched)
                     if live:
                         await live.close()
                     live = None
                     if action_dispatched:
                         print("JARVIS: Зв'язок обірвався після запуску дії. Її стан невідомий; повторно не запускаю.")
+                        continue
+                    if not settings.groq_api_key or not settings.fallback_enabled:
+                        await runtime.speak_fallback(message)
                         continue
             text = await runtime.transcribe_fallback(event.audio)
             if not text:

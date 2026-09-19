@@ -106,6 +106,22 @@ def _request_path(name: str) -> Path:
     return state_dir() / name
 
 
+def write_runtime_error(message: str) -> None:
+    _request_path("last-error.txt").write_text(message, encoding="utf-8")
+
+
+def read_runtime_error() -> str | None:
+    try:
+        message = _request_path("last-error.txt").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return message or None
+
+
+def clear_runtime_error() -> None:
+    _request_path("last-error.txt").unlink(missing_ok=True)
+
+
 def request_activation(pid: int) -> None:
     _request_path("activate.request").write_text(str(pid), encoding="ascii")
 
