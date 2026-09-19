@@ -75,13 +75,14 @@ class GeminiLiveSession:
             raise RuntimeError("GEMINI_API_KEY is required for Gemini Live.")
         from google.genai import types
 
+        tools = [types.Tool(function_declarations=self._function_declarations(self.tools.schemas()))]
+        if self.settings.web_enabled:
+            tools.append(types.Tool(google_search=types.GoogleSearch()))
+
         config = types.LiveConnectConfig(
             response_modalities=["AUDIO"] if native_audio else ["TEXT"],
             system_instruction=system_instruction,
-            tools=[
-                types.Tool(function_declarations=self._function_declarations(self.tools.schemas())),
-                types.Tool(google_search=types.GoogleSearch()),
-            ],
+            tools=tools,
             input_audio_transcription=types.AudioTranscriptionConfig(),
             output_audio_transcription=types.AudioTranscriptionConfig(),
         )

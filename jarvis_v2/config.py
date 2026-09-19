@@ -45,6 +45,7 @@ class Settings:
     groq_model: str
     voice_mode: str
     fallback_enabled: bool
+    web_enabled: bool
     debug: bool
     request_timeout_seconds: float
     live_timeout_seconds: float
@@ -94,6 +95,10 @@ class Settings:
             groq_model=_text("GROQ_MODEL", "openai/gpt-oss-120b"),
             voice_mode=_text("JARVIS_VOICE_MODE", "gemini").lower(),
             fallback_enabled=_boolean("JARVIS_FALLBACK_ENABLED", True),
+            # Live Google Search has a quota independent of the displayed Live
+            # request/token limits. Keep it opt-in so a web quota issue cannot
+            # prevent ordinary voice commands from starting.
+            web_enabled=_boolean("JARVIS_WEB_ENABLED", False),
             debug=_boolean("JARVIS_DEBUG", False),
             request_timeout_seconds=_integer("JARVIS_REQUEST_TIMEOUT_MS", 3500, 250) / 1000,
             live_timeout_seconds=_integer("JARVIS_LIVE_TIMEOUT_MS", 7000, 500) / 1000,

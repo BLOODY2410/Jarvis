@@ -47,6 +47,10 @@ uv run jarvis
 - **Fish Audio** is optional for the `fish` output path; native Gemini audio is the default.
 - **Memory** retains a short session, recent tools/entities, and only grounded facts with source URLs.
 
+Google Search is optional (`JARVIS_WEB_ENABLED=false` by default). Its allowance can differ from the
+Live model request/token limits shown in AI Studio. Keep it off for ordinary commands; enable it only
+when the current Google AI Studio project accepts grounded-search requests.
+
 The local fast path intentionally covers only safe, obvious actions: known websites/apps, volume, mute, media, settings and screenshots. `Відкрий новини` is a current-information request, never an invented executable. Damaged input such as `Við grey YouTube` asks for clarification and cannot produce a false acknowledgement.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) and [MIGRATION.md](MIGRATION.md).
