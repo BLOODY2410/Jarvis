@@ -14,6 +14,7 @@ from jarvis_v2.config import Settings
 from jarvis_v2.gemini_live import GeminiLiveSession
 from jarvis_v2.memory import MemoryStore
 from jarvis_v2.models import PersonalityMode
+from jarvis_v2.processes import RUNTIME_MUTEX, clear_runtime_state, write_runtime_state
 from jarvis_v2.providers import ProviderRouter
 from jarvis_v2.tools import ToolRegistry
 from jarvis_v2.voice import InProcessVoiceRuntime
@@ -21,14 +22,14 @@ from jarvis_v2.voice import InProcessVoiceRuntime
 
 class ProcessLock:
     def __init__(self, root: Path) -> None:
-        self.path = root / ".run" / "jarvis-v2.pid"
+        self.root = root
         self._mutex: int | None = None
 
     def _acquire_windows_mutex(self) -> None:
         if os.name != "nt":
             return
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        handle = kernel32.CreateMutexW(None, False, "Local\\JARVIS_v2_runtime")
+        handle = kernel32.CreateMutexW(None, False, RUNTIME_MUTEX)
         if not handle:
             raise OSError(ctypes.get_last_error(), "CreateMutexW failed")
         if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
@@ -38,26 +39,9 @@ class ProcessLock:
 
     def acquire(self) -> None:
         self._acquire_windows_mutex()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            for attempt in range(2):
-                try:
-                    descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                except FileExistsError:
-                    running_pid = "unknown"
-                    try:
-                        running_pid = self.path.read_text(encoding="ascii").strip()
-                        os.kill(int(running_pid), 0)
-                    except (ValueError, OSError):
-                        if attempt == 0:
-                            self.path.unlink(missing_ok=True)
-                            continue
-                    raise RuntimeError(f"JARVIS v2 already runs as PID {running_pid}") from None
-                else:
-                    with os.fdopen(descriptor, "w", encoding="ascii") as handle:
-                        handle.write(str(os.getpid()))
-                    return
-            raise RuntimeError("Could not acquire the JARVIS process lock.")
+            clear_runtime_state()
+            write_runtime_state(os.getpid(), self.root)
         except Exception:
             self._release_windows_mutex()
             raise
@@ -68,11 +52,7 @@ class ProcessLock:
             self._mutex = None
 
     def release(self) -> None:
-        try:
-            if self.path.exists() and self.path.read_text(encoding="ascii").strip() == str(os.getpid()):
-                self.path.unlink()
-        except OSError:
-            pass
+        clear_runtime_state(os.getpid())
         self._release_windows_mutex()
 
 
@@ -121,6 +101,9 @@ async def run_voice(agent: JarvisAgent, settings: Settings) -> int:
             if kind == "interrupt":
                 runtime.interrupt_playback()
                 continue
+            if kind == "stop":
+                print("JARVIS v2 зупинено через desktop-вікно.", flush=True)
+                break
             if kind != "audio":
                 continue
             conversation_active = True
@@ -156,10 +139,14 @@ async def run_voice(agent: JarvisAgent, settings: Settings) -> int:
             print(f"JARVIS: {reply.text}")
             await runtime.speak_fallback(reply.voice_text)
     finally:
-        if live:
-            await live.close()
-        await runtime.stop()
-        lock.release()
+        try:
+            if live:
+                await live.close()
+        finally:
+            try:
+                await runtime.stop()
+            finally:
+                lock.release()
 
 
 def parse_args() -> argparse.Namespace:
@@ -206,6 +193,10 @@ def main() -> None:
         raise SystemExit(asyncio.run(async_main()))
     except KeyboardInterrupt:
         print("JARVIS v2 зупинено.")
+    except RuntimeError as error:
+        # A second desktop window can race a runtime that is already alive.
+        # Keep the normal GUI free of an alarming PyInstaller traceback.
+        print(f"JARVIS v2: {error}", flush=True)
 
 
 if __name__ == "__main__":

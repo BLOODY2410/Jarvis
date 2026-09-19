@@ -13,6 +13,8 @@ import threading
 from pathlib import Path
 from tkinter import BooleanVar, StringVar, Tk, messagebox, ttk
 
+from jarvis_v2.processes import any_runtime_is_running, read_runtime_state, request_activation, request_stop
+
 APP_TITLE = "JARVIS v2"
 DEFAULT_ENV = """GEMINI_API_KEY=
 GROQ_API_KEY=
@@ -68,13 +70,9 @@ def update_env(text: str, updates: dict[str, str]) -> str:
 
 
 def runtime_pid(root: Path) -> int | None:
-    pid_file = root / ".run" / "jarvis-v2.pid"
-    try:
-        pid = int(pid_file.read_text(encoding="ascii").strip())
-        os.kill(pid, 0)
-    except (OSError, ValueError):
-        return None
-    return pid
+    del root  # Runtime state is shared across every extracted JARVIS folder.
+    state = read_runtime_state()
+    return state.pid if state else None
 
 
 class JarvisWindow:
@@ -205,7 +203,7 @@ class JarvisWindow:
             self.status.set("Налаштування збережено. Вони застосуються під час наступного запуску.")
 
     def start(self) -> None:
-        if self._launching or runtime_pid(self.project):
+        if self._launching or runtime_pid(self.project) or any_runtime_is_running():
             self.status.set("JARVIS уже працює.")
             return
         if not self.gemini_key.get().strip():
@@ -249,26 +247,25 @@ class JarvisWindow:
         threading.Thread(target=self._stop_worker, daemon=True).start()
 
     def listen_now(self) -> None:
-        if not runtime_pid(self.project):
+        state = read_runtime_state()
+        if state is None:
             messagebox.showwarning(APP_TITLE, "Спершу запустіть JARVIS.")
             return
-        request = self.project / ".run" / "activate-request"
-        request.parent.mkdir(parents=True, exist_ok=True)
-        request.write_text("listen", encoding="ascii")
+        request_activation(state.pid)
         self.status.set("Слухаю. Скажіть команду.")
 
     def _stop_worker(self) -> None:
-        pid = runtime_pid(self.project)
-        if pid is None:
+        state = read_runtime_state()
+        if state is None:
             self.root.after(0, self._refresh)
             return
         try:
-            os.kill(pid, 15)
-        except (OSError, subprocess.CalledProcessError) as error:
-            message = f"Не вдалося зупинити: {error}"
+            request_stop(state.pid)
+        except OSError as error:
+            message = f"Не вдалося надіслати запит зупинки: {error}"
             self.root.after(0, lambda: self.status.set(message))
             return
-        self.root.after(300, self._refresh)
+        self.root.after(700, self._refresh)
 
     def open_log(self) -> None:
         log_path = self.project / ".run" / "gui-runtime.log"
@@ -277,11 +274,18 @@ class JarvisWindow:
         os.startfile(log_path)  # type: ignore[attr-defined]
 
     def _refresh(self) -> None:
-        pid = runtime_pid(self.project)
-        if pid:
+        state = read_runtime_state()
+        if state:
             self._launching = False
             self.start_button.state(["disabled"])
-            self.status.set(f"JARVIS працює · PID {pid}")
+            if Path(state.root) == self.project.resolve():
+                self.status.set(f"JARVIS працює · PID {state.pid}")
+            else:
+                self.status.set(f"JARVIS працює в іншій папці · PID {state.pid}")
+        elif any_runtime_is_running():
+            self._launching = False
+            self.start_button.state(["disabled"])
+            self.status.set("JARVIS працює в іншому відкритому вікні")
         else:
             self._launching = False
             self.start_button.state(["!disabled"])

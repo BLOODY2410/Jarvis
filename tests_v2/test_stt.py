@@ -1,6 +1,9 @@
+import os
+
 import pytest
 
 from jarvis_v2.config import Settings
+from jarvis_v2.processes import request_activation
 from jarvis_v2.stt import SttPolicy
 from jarvis_v2.voice import InProcessVoiceRuntime
 
@@ -19,11 +22,9 @@ def test_stt_prompt_supports_surzhyk_and_custom_vocabulary() -> None:
 
 
 @pytest.mark.asyncio
-async def test_desktop_activation_request_stays_local(tmp_path) -> None:
+async def test_desktop_activation_request_stays_local(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     runtime = InProcessVoiceRuntime(Settings.from_env(tmp_path))
-    request = tmp_path / ".run" / "activate-request"
-    request.parent.mkdir(parents=True)
-    request.write_text("listen", encoding="ascii")
+    request_activation(os.getpid())
     event = await runtime.next_event(timeout=0.01)
     assert event.kind == "wake"
-    assert not request.exists()
