@@ -193,6 +193,12 @@ class InProcessVoiceRuntime:
         self._stream = None
 
     async def next_event(self, timeout: float = 0.5) -> AudioEvent:
+        # The desktop window can request local activation without a second
+        # service, global keyboard hook, or continuous cloud microphone feed.
+        activation_request = self.settings.root / ".run" / "activate-request"
+        if activation_request.exists():
+            activation_request.unlink(missing_ok=True)
+            self.activate()
         try:
             return await asyncio.to_thread(self._events.get, True, timeout)
         except queue.Empty:

@@ -121,6 +121,7 @@ class JarvisWindow:
         self.start_button = ttk.Button(buttons, text="Запустити JARVIS", command=self.start)
         self.start_button.pack(side="left")
         ttk.Button(buttons, text="Зупинити", command=self.stop).pack(side="left", padx=8)
+        ttk.Button(buttons, text="Слухати зараз", command=self.listen_now).pack(side="left")
         ttk.Button(buttons, text="Відкрити журнал", command=self.open_log).pack(side="right")
         settings = ttk.LabelFrame(frame, text="Налаштування", padding=14)
         settings.grid(row=4, column=0, sticky="nsew")
@@ -133,7 +134,7 @@ class JarvisWindow:
         ttk.Checkbutton(settings, text="Увімкнути резервний режим", variable=self.fallback).grid(row=4, column=1, sticky="w", pady=5)
         ttk.Checkbutton(settings, text="Діагностичний журнал", variable=self.debug).grid(row=5, column=1, sticky="w", pady=5)
         ttk.Button(frame, text="Зберегти налаштування", command=self.save).grid(row=5, column=0, sticky="w", pady=(18, 0))
-        ttk.Label(frame, text="Після першого запуску скажіть «Джарвіс» або натисніть Ctrl+Alt+J.", foreground="#aab8ca").grid(row=6, column=0, sticky="w", pady=(14, 0))
+        ttk.Label(frame, text="Після запуску натисніть «Слухати зараз» або Ctrl+Alt+J, потім скажіть команду.", foreground="#aab8ca").grid(row=6, column=0, sticky="w", pady=(14, 0))
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(4, weight=1)
 
@@ -246,6 +247,15 @@ class JarvisWindow:
     def stop(self) -> None:
         self.status.set("Зупиняю JARVIS…")
         threading.Thread(target=self._stop_worker, daemon=True).start()
+
+    def listen_now(self) -> None:
+        if not runtime_pid(self.project):
+            messagebox.showwarning(APP_TITLE, "Спершу запустіть JARVIS.")
+            return
+        request = self.project / ".run" / "activate-request"
+        request.parent.mkdir(parents=True, exist_ok=True)
+        request.write_text("listen", encoding="ascii")
+        self.status.set("Слухаю. Скажіть команду.")
 
     def _stop_worker(self) -> None:
         pid = runtime_pid(self.project)

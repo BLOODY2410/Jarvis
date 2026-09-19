@@ -1,4 +1,8 @@
+import pytest
+
+from jarvis_v2.config import Settings
 from jarvis_v2.stt import SttPolicy
+from jarvis_v2.voice import InProcessVoiceRuntime
 
 
 def test_stt_primary_and_fallback_policy() -> None:
@@ -12,3 +16,14 @@ def test_stt_prompt_supports_surzhyk_and_custom_vocabulary() -> None:
     assert "Українська, російська або суржикова" in prompt
     assert "YouTube Music" in prompt
     assert "BLOODY2410" in prompt
+
+
+@pytest.mark.asyncio
+async def test_desktop_activation_request_stays_local(tmp_path) -> None:
+    runtime = InProcessVoiceRuntime(Settings.from_env(tmp_path))
+    request = tmp_path / ".run" / "activate-request"
+    request.parent.mkdir(parents=True)
+    request.write_text("listen", encoding="ascii")
+    event = await runtime.next_event(timeout=0.01)
+    assert event.kind == "wake"
+    assert not request.exists()
