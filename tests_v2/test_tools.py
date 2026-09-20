@@ -1,4 +1,4 @@
-from jarvis_v2.tools import SETTINGS_URIS, ToolRegistry
+from jarvis_v2.tools import SETTINGS_URIS, ToolRegistry, WindowsBackend
 
 
 class FakeBackend:
@@ -80,3 +80,22 @@ def test_power_is_not_a_direct_model_tool() -> None:
     registry = ToolRegistry(FakeBackend())
     assert "power" not in {schema["function"]["name"] for schema in registry.schemas()}
     assert not registry.execute("power", {"action": "shutdown"}).success
+
+
+def test_unknown_app_is_never_dispatched_to_path(monkeypatch) -> None:
+    called = False
+
+    def forbidden(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("unknown app reached Popen")
+
+    monkeypatch.setattr("jarvis_v2.tools.subprocess.Popen", forbidden)
+    monkeypatch.setattr(WindowsBackend, "_find_shortcut", staticmethod(lambda _app: None))
+    result = WindowsBackend().open_app("model supplied unknown.exe")
+    assert not result.success
+    assert not called
+
+
+def test_close_never_blindly_terminates_without_window() -> None:
+    assert WindowsBackend._request_graceful_close([]) == 0

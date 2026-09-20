@@ -9,7 +9,16 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from jarvis_v2.models import GroundingSource, Intent, ToolResult
+from jarvis_v2.models import GroundingSource, ToolResult
+
+
+@dataclass(frozen=True, slots=True)
+class PendingConfirmation:
+    """Canonical host-owned action; never reconstructed from a model reply."""
+
+    name: str
+    arguments: dict[str, object]
+    label: str
 
 
 @dataclass(slots=True)
@@ -26,7 +35,7 @@ class SessionState:
     last_tool: str | None = None
     recent_entities: deque[str] = field(default_factory=lambda: deque(maxlen=20))
     conversation_summary: str = ""
-    pending_confirmation: Intent | None = None
+    pending_confirmation: PendingConfirmation | None = None
     pending_confirmation_created_at: float = 0
 
     def add_message(self, role: str, content: str, max_turns: int) -> None:

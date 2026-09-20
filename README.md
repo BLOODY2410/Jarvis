@@ -47,7 +47,8 @@ uv run jarvis
 - **Fish Audio** is optional for the `fish` output path; native Gemini audio is the default.
 - **Memory** retains a short session, recent tools/entities, and only grounded facts with source URLs.
 
-Google Search is optional (`JARVIS_WEB_ENABLED=false` by default). Its allowance can differ from the
+Google Search is optional (`JARVIS_WEB_ENABLED=false` by default). The flag gates both Live and text
+companion calls; when it is off, current-information requests explicitly say web is unavailable. Its allowance can differ from the
 Live model request/token limits shown in AI Studio. Keep it off for ordinary commands; enable it only
 when the current Google AI Studio project accepts grounded-search requests.
 
@@ -64,3 +65,5 @@ uv run jarvis --doctor
 ```
 
 The automated suite uses mock SDK sessions and does not claim a successful cloud call. A Gemini Live voice session needs a real `GEMINI_API_KEY`, microphone permission and an interactive Windows audio check.
+
+The optional wake backend has no bundled Ukrainian model. Startup reports `wake_word: unavailable (hotkey only)` when no compatible local model is installed; Ctrl+Alt+J remains the reliable activation route. Raw microphone input stays local until activation.

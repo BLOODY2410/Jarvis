@@ -6,7 +6,7 @@ from pathlib import Path
 
 from jarvis_v2.config import Settings
 from jarvis_v2.intents import SemanticIntentRouter, deterministic_intent
-from jarvis_v2.memory import MemoryStore, SessionState
+from jarvis_v2.memory import MemoryStore, PendingConfirmation, SessionState
 from jarvis_v2.models import (
     AgentReply,
     IntentEnvelope,
@@ -48,26 +48,10 @@ class JarvisAgent:
 
     async def handle(self, text: str, *, voice: bool = True) -> AgentReply:
         trace = LatencyTrace(text)
-        self._remember_message("user", text)
-        if self.session.pending_confirmation:
-            pending = self.session.pending_confirmation
-            if time.monotonic() - self.session.pending_confirmation_created_at > 30:
-                self.session.pending_confirmation = None
-                return self._reply(
-                    "Час підтвердження минув. Дію скасовано.",
-                    Route.PC_AGENT,
-                    PersonalityMode.PC_AGENT,
-                    voice=voice,
-                )
-            normalized = text.lower().strip(" .!?")
-            if normalized in {"так", "підтверджую", "підтверди", "yes"}:
-                self.session.pending_confirmation = None
-                result = await asyncio.to_thread(self.tools.execute_intent, pending)
-                return self._tool_reply([result], voice=voice)
-            if normalized in {"ні", "скасуй", "відміна", "cancel", "no"}:
-                self.session.pending_confirmation = None
-                return self._reply("Дію скасовано.", Route.PC_AGENT, PersonalityMode.PC_AGENT, voice=voice)
-            return self._reply("Очікую чітке підтвердження або скасування дії.", Route.PC_AGENT, PersonalityMode.PC_AGENT, voice=voice)
+        self.record_user_turn(text)
+        confirmation = await self.consume_confirmation(text, voice=voice)
+        if confirmation:
+            return confirmation
         envelope = deterministic_intent(text)
         trace.mark("intent")
         if envelope is None and looks_like_action(text):
@@ -106,15 +90,93 @@ class JarvisAgent:
         trace.provider = reply.provider
         trace.mark("complete")
         self.latency.write(trace)
-        self._remember_message("assistant", reply.text)
+        self.record_assistant_turn(reply.text)
         return reply
+
+    def record_user_turn(self, text: str) -> None:
+        if text.strip():
+            self._remember_message("user", text)
+
+    def record_assistant_turn(self, text: str) -> None:
+        if text.strip():
+            self._remember_message("assistant", text)
+
+    async def consume_confirmation(self, text: str, *, voice: bool) -> AgentReply | None:
+        pending = self.session.pending_confirmation
+        if not pending:
+            return None
+        if time.monotonic() - self.session.pending_confirmation_created_at > 30:
+            self.session.pending_confirmation = None
+            return self._reply("Час підтвердження минув. Дію скасовано.", Route.PC_AGENT, PersonalityMode.PC_AGENT, voice=voice)
+        normalized = text.lower().strip(" .!?")
+        if normalized in {"так", "підтверджую", "підтверди", "yes"}:
+            self.session.pending_confirmation = None
+            result = await asyncio.to_thread(self.tools.execute_confirmed, pending.name, pending.arguments)
+            return self._tool_reply([result], voice=voice)
+        if normalized in {"ні", "скасуй", "відміна", "cancel", "no"}:
+            self.session.pending_confirmation = None
+            return self._reply("Дію скасовано.", Route.PC_AGENT, PersonalityMode.PC_AGENT, voice=voice)
+        return self._reply("Очікую чітке підтвердження або скасування дії.", Route.PC_AGENT, PersonalityMode.PC_AGENT, voice=voice)
+
+    async def fast_path(self, text: str, *, voice: bool = True) -> AgentReply | None:
+        """Small deterministic preflight for an already-local transcript."""
+        confirmation = await self.consume_confirmation(text, voice=voice)
+        if confirmation:
+            return confirmation
+        envelope = deterministic_intent(text)
+        if envelope is None or envelope.route != Route.PC_AGENT:
+            return None
+        return await self._pc(envelope, text, voice=voice)
+
+    def persona_mode(self, text: str) -> PersonalityMode:
+        envelope = deterministic_intent(text)
+        return PersonalityMode.LIVE_INFO if envelope and envelope.route == Route.LIVE_CURRENT else infer_personality(text)
+
+    def live_guidance(self, text: str) -> str:
+        entities = ", ".join(list(self.session.recent_entities)[-3:]) or "немає"
+        pending = "є, чекай так/ні" if self.session.pending_confirmation else "немає"
+        return f"Контекст хоста: режим {self.persona_mode(text).value}; сутності: {entities}; підтвердження: {pending}; попередній «сер»: {self.persona.last_used_sir}."
+
+    def needs_extended_thinking(self, text: str) -> bool:
+        lowered = text.lower()
+        signals = ("проаналізуй", "діагност", "виправ помил", "спочатку", "потім", "якщо")
+        return sum(signal in lowered for signal in signals) >= 2 or ("екран" in lowered and "помил" in lowered)
+
+    async def execute_live_tool(self, name: str, arguments: dict[str, object]) -> ToolResult:
+        if name in {"copy_file", "move_file"}:
+            if self.session.pending_confirmation:
+                return ToolResult(tool=name, success=False, message="Спершу підтвердьте або скасуйте попередню дію.")
+            canonical = self.tools.prepare_confirmation(name, arguments)
+            if canonical is None:
+                return ToolResult(tool=name, success=False, message="Некоректні аргументи інструмента.")
+            label = "копіювання" if name == "copy_file" else "переміщення"
+            label = f"{label} «{canonical['source']}» до «{canonical['destination']}»"
+            self.session.pending_confirmation = PendingConfirmation(name, canonical, label)
+            self.session.pending_confirmation_created_at = time.monotonic()
+            return ToolResult(tool=name, success=False, message=f"Потрібне явне підтвердження для {label} файла.")
+        result = await asyncio.to_thread(self.tools.execute, name, arguments)
+        if result.success and name == "open_app" and "app" not in result.data and isinstance(arguments.get("app"), str):
+            result.data["app"] = arguments["app"]
+        self._remember_tool(result)
+        return result
+
+    def record_grounded_live(self, query: str, answer: str, sources: list[object]) -> None:
+        """Persist Live facts only after the transport supplied real web URLs."""
+        valid = [source for source in sources if getattr(source, "url", "").startswith(("https://", "http://"))]
+        if not valid or not answer.strip():
+            return
+        self.session.grounded_facts.append(
+            {"query": query, "answer": answer, "sources": [source.model_dump() for source in valid]}
+        )
+        if self.memory:
+            self.memory.grounded(self.session.session_id, query, answer, valid)
 
     async def _pc(self, envelope: IntentEnvelope, text: str, *, voice: bool) -> AgentReply:
         power = next((intent for intent in envelope.intents if isinstance(intent, PowerIntent)), None)
         if power:
-            self.session.pending_confirmation = power
-            self.session.pending_confirmation_created_at = time.monotonic()
             labels = {"shutdown": "вимкнення", "restart": "перезавантаження", "sleep": "сон"}
+            self.session.pending_confirmation = PendingConfirmation("power", {"action": power.action}, labels[power.action])
+            self.session.pending_confirmation_created_at = time.monotonic()
             return self._reply(
                 f"Підтвердьте {labels[power.action]} комп'ютера.",
                 Route.PC_AGENT,
@@ -138,7 +200,7 @@ class JarvisAgent:
             messages=self._context(text),
             system=self.persona.prompt(PersonalityMode.PC_AGENT),
             route=Route.PC_AGENT,
-            tools=self.tools.schemas(),
+            tools=self.tools.schemas(include_confirmable=True),
             max_tokens=400,
         )
         all_results: list[ToolResult] = []
@@ -167,7 +229,10 @@ class JarvisAgent:
                 }
             )
             for call in response.tool_calls:
-                result = await asyncio.to_thread(self.tools.execute, call.name, call.arguments)
+                if call.name in {"copy_file", "move_file"}:
+                    result = await self.execute_live_tool(call.name, call.arguments)
+                else:
+                    result = await asyncio.to_thread(self.tools.execute, call.name, call.arguments)
                 all_results.append(result)
                 request.messages.append(
                     {"role": "tool", "tool_call_id": call.id, "content": result.model_dump_json()}
@@ -199,11 +264,19 @@ class JarvisAgent:
 
     async def _live(self, envelope: IntentEnvelope, *, voice: bool) -> AgentReply:
         query = envelope.query or ""
+        if not self.settings.web_enabled:
+            return self._reply(
+                "Веб-пошук вимкнено, тому не подаю неперевірену актуальну відповідь.",
+                Route.LIVE_CURRENT,
+                PersonalityMode.LIVE_INFO,
+                voice=voice,
+            )
         request = ProviderRequest(
             messages=self._context(query),
             system=self.persona.prompt(PersonalityMode.LIVE_INFO),
             route=Route.LIVE_CURRENT,
             max_tokens=650,
+            web_enabled=self.settings.web_enabled,
         )
         try:
             response = await self.providers.complete(request)

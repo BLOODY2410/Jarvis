@@ -226,19 +226,32 @@ class WindowsBackend:
         return ToolResult(tool="set_mute", success=actual == muted, message=text, data={"muted": actual})
 
     def open_app(self, app: str) -> ToolResult:
-        executable = APP_EXECUTABLES.get(app.lower(), app)
+        executable = APP_EXECUTABLES.get(app.lower())
+        shortcut = self._find_shortcut(app)
+        # Never let an LLM-provided value become a PATH lookup.  A known alias
+        # or an enumerated Start Menu shortcut is the authorization boundary.
+        if executable is None and shortcut is None:
+            return ToolResult(tool="open_app", success=False, message=f"Програму «{app}» не знайдено.")
         try:
-            subprocess.Popen([executable], close_fds=True)
-        except OSError:
-            shortcut = self._find_shortcut(app)
-            if shortcut is None:
-                return ToolResult(tool="open_app", success=False, message=f"Програму «{app}» не знайдено.")
-            try:
+            if executable:
+                subprocess.Popen([executable], close_fds=True)
+            else:
                 os.startfile(shortcut)  # type: ignore[attr-defined]
-            except OSError as error:
-                return ToolResult(
-                    tool="open_app", success=False, message=f"Windows не прийняла запит: {error}."
-                )
+        except OSError as error:
+            if executable and shortcut is not None:
+                try:
+                    os.startfile(shortcut)  # type: ignore[attr-defined]
+                except OSError:
+                    pass
+                else:
+                    return ToolResult(
+                        tool="open_app", success=True,
+                        message=f"Windows прийняла запит на запуск «{app}».",
+                        data={"dispatched": True, "app": app},
+                    )
+            return ToolResult(
+                tool="open_app", success=False, message=f"Windows не прийняла запит: {error}."
+            )
         return ToolResult(
             tool="open_app",
             success=True,
@@ -283,14 +296,39 @@ class WindowsBackend:
             return ToolResult(
                 tool="close_app", success=False, message=f"Запущену програму «{app}» не знайдено."
             )
-        for process in matches:
-            process.terminate()
-        _, alive = psutil.wait_procs(matches, timeout=2)
-        if alive:
-            return ToolResult(tool="close_app", success=False, message=f"«{app}» не завершила роботу вчасно.")
+        closed = self._request_graceful_close(matches)
+        if not closed:
+            return ToolResult(
+                tool="close_app", success=False,
+                message=f"Не знайшов вікна для безпечного закриття «{app}». Примусове завершення не виконано.",
+            )
         return ToolResult(
-            tool="close_app", success=True, message=f"«{app}» закрито.", data={"count": len(matches)}
+            tool="close_app", success=True, message=f"Надіслано запит на закриття «{app}».", data={"count": closed}
         )
+
+    @staticmethod
+    def _request_graceful_close(processes: list[Any]) -> int:
+        """Post WM_CLOSE to visible top-level windows; never terminate as fallback."""
+        if os.name != "nt":
+            return 0
+        pids = {int(process.pid) for process in processes}
+        user32 = ctypes.windll.user32
+        sent = 0
+        callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+        user32.PostMessageW.restype = ctypes.c_bool
+
+        @callback_type
+        def visit(hwnd: int, _param: int) -> bool:
+            nonlocal sent
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value in pids and user32.IsWindowVisible(hwnd) and user32.PostMessageW(hwnd, 0x0010, 0, 0):
+                sent += 1  # WM_CLOSE
+            return True
+
+        user32.EnumWindows(visit, 0)
+        return sent
 
     @staticmethod
     def open_url(url: str) -> ToolResult:
@@ -555,10 +593,37 @@ class ToolRegistry:
             "move_file": ToolDefinition("move_file", "Move a file after host confirmation.", FileTransferArgs, lambda args: self.backend.transfer_file(args.source, args.destination, move=True)),
         }
 
-    def schemas(self) -> list[dict[str, object]]:
+    def schemas(self, *, include_confirmable: bool = False) -> list[dict[str, object]]:
         # Power needs a host-owned user confirmation, so the model cannot invoke
         # it directly by inventing an argument or a confirmation token.
-        return [tool.schema() for name, tool in self._tools.items() if name not in {"power", "copy_file", "move_file"}]
+        hidden = {"power"} if include_confirmable else {"power", "copy_file", "move_file"}
+        return [tool.schema() for name, tool in self._tools.items() if name not in hidden]
+
+    def validate_arguments(self, name: str, arguments: dict[str, object]) -> dict[str, object] | None:
+        """Validate once before a confirmation is stored by the host."""
+        tool = self._tools.get(name)
+        if tool is None:
+            return None
+        try:
+            return tool.arguments.model_validate(arguments).model_dump()
+        except ValidationError:
+            return None
+
+    def prepare_confirmation(self, name: str, arguments: dict[str, object]) -> dict[str, object] | None:
+        """Return canonical transfer paths before storing a pending action."""
+        canonical = self.validate_arguments(name, arguments)
+        if canonical is None:
+            return None
+        if name in {"copy_file", "move_file"} and isinstance(self.backend, WindowsBackend):
+            try:
+                source = self.backend._safe_user_path(str(canonical["source"]))
+                destination = self.backend._safe_user_path(str(canonical["destination"]))
+            except (KeyError, ValueError):
+                return None
+            if not source.is_file() or destination.exists():
+                return None
+            return {"source": str(source), "destination": str(destination)}
+        return canonical
 
     def execute(self, name: str, arguments: dict[str, object]) -> ToolResult:
         if name in {"power", "copy_file", "move_file"}:

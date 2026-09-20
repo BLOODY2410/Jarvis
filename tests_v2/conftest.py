@@ -20,4 +20,5 @@ def settings(tmp_path: Path) -> Settings:
         circuit_failures=1,
         circuit_cooldown_seconds=60,
         fallback_enabled=True,
+        web_enabled=True,
     )

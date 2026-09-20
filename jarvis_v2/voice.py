@@ -12,6 +12,7 @@ import io
 import os
 import queue
 import threading
+import time
 import wave
 from collections import deque
 from contextlib import suppress
@@ -20,6 +21,7 @@ from typing import Any
 
 from jarvis_v2.config import Settings
 from jarvis_v2.processes import consume_request
+from jarvis_v2.stt import SttPolicy
 
 
 @dataclass(slots=True)
@@ -52,12 +54,18 @@ class InProcessVoiceRuntime:
         self._speaking = threading.Event()
         self._playback_stop = threading.Event()
         self._wake_model: Any = None
+        self.wake_status = "unavailable (hotkey only)"
         self._activation_epoch = 0
         self._activation_lock = threading.Lock()
+        self._audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=120)
+        self._playback_task: asyncio.Task[None] | None = None
+        self.first_audio_latency_ms: float | None = None
+        self._turn_started_at: float | None = None
 
     async def start(self) -> None:
         self._load_wake_model()
         self._start_hotkey()
+        self._playback_task = asyncio.create_task(self._playback_loop())
         if not self.settings.voice_input_enabled:
             return
         try:
@@ -89,8 +97,10 @@ class InProcessVoiceRuntime:
             from openwakeword.model import Model
 
             self._wake_model = Model()
+            self.wake_status = "available (OpenWakeWord; no Ukrainian model bundled)"
         except Exception:
             self._wake_model = None
+            self.wake_status = "unavailable (hotkey only)"
 
     def _start_hotkey(self) -> None:
         try:
@@ -162,7 +172,6 @@ class InProcessVoiceRuntime:
             if self._speaking.is_set():
                 interrupt_frames = interrupt_frames + 1 if voiced else 0
                 if interrupt_frames >= 3:
-                    self.interrupt_playback()
                     self._events.put(AudioEvent("interrupt"))
                     interrupt_frames = 0
                 continue
@@ -189,6 +198,12 @@ class InProcessVoiceRuntime:
 
     async def stop(self) -> None:
         self._stop.set()
+        self.interrupt_playback()
+        if self._playback_task:
+            self._playback_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._playback_task
+            self._playback_task = None
         if self._stream is not None:
             await asyncio.to_thread(self._stream.stop)
             await asyncio.to_thread(self._stream.close)
@@ -216,25 +231,62 @@ class InProcessVoiceRuntime:
 
     def interrupt_playback(self) -> None:
         self._playback_stop.set()
+        self._speaking.clear()
+        while True:
+            try:
+                self._audio_queue.get_nowait()
+                self._audio_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+        try:
+            import sounddevice as sd
 
-    async def play_pcm(self, chunks: list[bytes], sample_rate: int = 24_000) -> None:
-        if not chunks:
+            sd.stop()
+        except Exception:
+            pass
+
+    def begin_response_timing(self) -> None:
+        self._turn_started_at = time.monotonic()
+        self.first_audio_latency_ms = None
+        self._playback_stop.clear()
+
+    async def enqueue_pcm(self, chunk: bytes) -> None:
+        """Return as soon as the chunk is queued; receive loop never plays audio."""
+        if not chunk:
             return
+        if self.first_audio_latency_ms is None and self._turn_started_at is not None:
+            self.first_audio_latency_ms = (time.monotonic() - self._turn_started_at) * 1000
+        # Audio is best-effort under a stalled output device.  Do not block
+        # Live receiving or tool receipts behind a speaker failure.
+        with suppress(asyncio.QueueFull):
+            self._audio_queue.put_nowait(chunk)
+
+    async def _playback_loop(self) -> None:
+        while True:
+            chunk = await self._audio_queue.get()
+            try:
+                if chunk is not None and not self._playback_stop.is_set():
+                    await self._play_chunk(chunk)
+            finally:
+                self._audio_queue.task_done()
+
+    async def _play_chunk(self, chunk: bytes, sample_rate: int = 24_000) -> None:
         try:
             import numpy as np
             import sounddevice as sd
         except ImportError:
             return
         self._speaking.set()
-        self._playback_stop.clear()
         try:
-            for chunk in chunks:
-                if self._playback_stop.is_set():
-                    break
-                samples = np.frombuffer(chunk, dtype="<i2")
-                await asyncio.to_thread(sd.play, samples, sample_rate, blocking=True)
+            samples = np.frombuffer(chunk, dtype="<i2")
+            await asyncio.to_thread(sd.play, samples, sample_rate, blocking=True)
         finally:
             self._speaking.clear()
+
+    async def play_pcm(self, chunks: list[bytes], sample_rate: int = 24_000) -> None:
+        del sample_rate
+        for chunk in chunks:
+            await self.enqueue_pcm(chunk)
 
     async def speak_fallback(self, text: str) -> None:
         """Fish SDK when configured, with Windows SAPI as a local last resort."""
@@ -296,18 +348,23 @@ class InProcessVoiceRuntime:
             output.setframerate(self.sample_rate)
             output.writeframes(pcm)
         buffer.name = "utterance.wav"
-        prompt = "Українська, російська або суржикова команда для Джарвіса. " + ", ".join(
-            self.settings.custom_vocabulary
-        )
-        try:
-            result = await asyncio.to_thread(
-                Groq(api_key=self.settings.groq_api_key).audio.transcriptions.create,
-                file=buffer,
-                model="whisper-large-v3-turbo",
-                language=None,
-                prompt=prompt,
-                response_format="json",
-            )
-        except Exception:
-            return ""
-        return str(getattr(result, "text", "")).strip()
+        policy = SttPolicy(custom_vocabulary=self.settings.custom_vocabulary)
+        speech_ms = len(pcm) * 1000 // (self.sample_rate * 2)
+        client = Groq(api_key=self.settings.groq_api_key)
+        for model in policy.models_for(speech_ms):
+            buffer.seek(0)
+            try:
+                result = await asyncio.to_thread(
+                    client.audio.transcriptions.create,
+                    file=buffer,
+                    model=model,
+                    language=None,
+                    prompt=policy.prompt(),
+                    response_format="json",
+                )
+            except Exception:
+                continue
+            text = str(getattr(result, "text", "")).strip()
+            if text:
+                return text
+        return ""

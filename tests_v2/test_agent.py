@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 
 import pytest
 
@@ -70,6 +71,17 @@ async def test_ungrounded_live_answer_is_not_presented_as_fact(settings) -> None
     reply = await agent.handle("Відкрий новини", voice=False)
     assert "Не вдалося отримати актуальні дані" in reply.text
     assert "Trust me" not in reply.text
+
+
+@pytest.mark.asyncio
+async def test_web_disabled_refuses_current_info_without_calling_provider(settings) -> None:
+    agent = JarvisAgent(
+        replace(settings, web_enabled=False),
+        ProviderRouter(settings, [LiveProvider()]),
+        ToolRegistry(FakeBackend()),
+    )
+    reply = await agent.handle("Що там у новинах сьогодні?", voice=False)
+    assert "Веб-пошук вимкнено" in reply.text
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,7 @@ class ProviderRequest:
     response_schema: type[BaseModel] | None = None
     images: list[Path] = field(default_factory=list)
     max_tokens: int = 500
+    web_enabled: bool = False
 
 
 class ProviderFailure(RuntimeError):
@@ -97,7 +98,7 @@ class GeminiProvider:
         from google.genai import types
 
         config: dict[str, Any] = {"system_instruction": request.system, "max_output_tokens": request.max_tokens}
-        if request.route == Route.LIVE_CURRENT:
+        if request.route == Route.LIVE_CURRENT and request.web_enabled:
             config["tools"] = [types.Tool(google_search=types.GoogleSearch())]
         elif request.tools:
             config["tools"] = [

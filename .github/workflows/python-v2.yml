@@ -1,0 +1,20 @@
+name: Python v2
+
+on:
+  pull_request:
+  push:
+    branches: [master, feature/gemini-live-v2]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: uv sync --extra dev
+      - run: uv run pytest tests_v2
+      - run: uv run ruff check jarvis_v2 tests_v2
+      - run: uv run python -m compileall -q jarvis_v2

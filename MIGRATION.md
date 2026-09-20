@@ -1,10 +1,11 @@
 # Migration from Rust v1
 
-The active implementation is Python-only. The complete Rust v1 source remains recoverable at Git tag `legacy-rust-v1`.
+The active implementation is Python-only. The complete Rust v1 source remains recoverable at remote branch `legacy-rust-v1`.
 
 ```powershell
-git show legacy-rust-v1:README.md
-git switch --detach legacy-rust-v1
+git fetch origin legacy-rust-v1
+git show origin/legacy-rust-v1:README.md
+git switch --detach origin/legacy-rust-v1
 ```
 
 ## Removed from v2
